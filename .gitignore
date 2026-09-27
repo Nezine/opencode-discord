@@ -5,3 +5,8 @@ __pycache__/
 *.egg-info/
 state.db
 .commandcode/
+
+# Native engine build artifacts
+build/
+build-sanitize/
+*.so

@@ -17,4 +17,13 @@ if [[ ! -x .venv/bin/python ]]; then
   exit 1
 fi
 
+# The native engine is a build artifact, so make it on first run.
+shopt -s nullglob
+engine=(bot/_engine*.so)
+shopt -u nullglob
+if (( ${#engine[@]} == 0 )); then
+  echo "Native engine not built yet; running ./build.sh" >&2
+  ./build.sh
+fi
+
 exec .venv/bin/python -m bot.main "$@"

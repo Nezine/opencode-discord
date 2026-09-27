@@ -6,6 +6,15 @@ set -uo pipefail
 cd "$(dirname "$0")"
 PY=.venv/bin/python
 
+# The native engine is a build artifact; make sure it exists before importing it.
+shopt -s nullglob
+engine=(bot/_engine*.so)
+shopt -u nullglob
+if (( ${#engine[@]} == 0 )); then
+  echo "Native engine not built yet; running ./build.sh"
+  ./build.sh || exit 1
+fi
+
 status=0
 run() {
   echo
@@ -13,6 +22,8 @@ run() {
   "$@" || status=1
 }
 
+run "$PY" -m tests.engine_smoke
+run "$PY" -m tests.parser_parity
 run "$PY" -m tests.units
 run "$PY" -m tests.discord_surface
 run "$PY" -m tests.view_callbacks

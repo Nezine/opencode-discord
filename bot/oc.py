@@ -10,6 +10,10 @@ from typing import Any
 
 import aiohttp
 
+# SSEParser lives in the native engine (cpp/sse.cpp). It stays importable from
+# this module because bot.runner and the test suite reference bot.oc.SSEParser.
+from ._engine import SSEParser  # noqa: F401
+
 log = logging.getLogger("oc")
 
 Event = dict[str, Any]
@@ -33,69 +37,9 @@ class OpenCodeError(RuntimeError):
         return self.status == 409
 
 
-class SSEParser:
-    """Incremental parser for the server-sent-event stream.
-
-    aiohttp's line reader refuses any single line over 512 KiB, and one OpenCode
-    event can easily be larger than that (a tool that returns a whole file). So
-    the raw byte stream is split here instead, with a generous per-line cap: an
-    event past the cap is dropped rather than being allowed to wedge the reader.
-    """
-
-    MAX_LINE = 8 * 1024 * 1024
-
-    def __init__(self) -> None:
-        self._buffer = b""
-        self._name: str | None = None
-        self.dropped = 0
-        self.largest = 0
-
-    def feed(self, chunk: bytes) -> list[Event]:
-        """Add bytes and return every event completed by them."""
-        self._buffer += chunk
-        events: list[Event] = []
-        while True:
-            index = self._buffer.find(b"\n")
-            if index < 0:
-                if len(self._buffer) > self.MAX_LINE:
-                    log.warning("dropping an oversized SSE line (%d bytes)", len(self._buffer))
-                    self.dropped += 1
-                    self._buffer = b""
-                break
-            line = self._buffer[:index]
-            self._buffer = self._buffer[index + 1 :]
-            if len(line) > self.MAX_LINE:
-                self.dropped += 1
-                continue
-            event = self._line(line)
-            if event is not None:
-                events.append(event)
-        return events
-
-    def _line(self, raw: bytes) -> Event | None:
-        line = raw.decode("utf-8", "replace").rstrip("\r")
-        if not line:
-            return None
-        if line.startswith("event:"):
-            self._name = line[6:].strip()
-            return None
-        if not line.startswith("data:"):
-            return None
-        data = line[5:].strip()
-        if not data or data == "[DONE]":
-            return None
-        self.largest = max(self.largest, len(data))
-        try:
-            event = json.loads(data)
-        except ValueError:
-            log.debug("ignoring unparseable SSE payload (%d bytes)", len(data))
-            return None
-        if not isinstance(event, dict):
-            return None
-        if self._name and "type" not in event:
-            event["type"] = self._name
-        self._name = None
-        return event
+# SSEParser moved to the native engine. The port is covered by
+# tests/parser_parity.py, which runs the same corpus through this module's
+# re-export and the original Python implementation.
 
 
 class OpenCodeClient:
