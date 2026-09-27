@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "sse.hpp"
+#include "store.hpp"
 #include "text.hpp"
 
 namespace {
@@ -147,11 +148,77 @@ void test_sse() {
     eq("largest is tracked", largest.largest > 0, true);
 }
 
+void test_store() {
+    std::printf("\nstore\n");
+
+    using Field = std::pair<std::string, std::optional<std::string>>;
+
+    engine::Store store(":memory:");
+
+    const engine::UserState empty = store.get_user(42);
+    eq("unknown user has no session", empty.session_id.has_value(), false);
+    eq("no model yet", empty.has_model(), false);
+    eq("no model label", empty.model_label(), std::string("default"));
+
+    engine::UserState state;
+    state.user_id = 42;
+    state.session_id = "ses_a";
+    state.provider_id = "google";
+    state.model_id = "gemini";
+    state.variant = "high";
+    state.agent = "build";
+    state.directory = "/tmp";
+    state.title = "first";
+    store.save_user(state);
+
+    const engine::UserState loaded = store.get_user(42);
+    eq("session round trips", loaded.session_id.value_or(""), std::string("ses_a"));
+    eq("model round trips", loaded.model_label(), std::string("google/gemini \u00b7 high"));
+    eq("directory round trips", loaded.directory.value_or(""), std::string("/tmp"));
+
+    const engine::UserState updated =
+        store.update(42, {Field{"session_id", "ses_b"}, Field{"title", "second"},
+                          Field{"bogus_field", "ignored"}});
+    eq("update applies", updated.session_id.value_or(""), std::string("ses_b"));
+    eq("update keeps other fields", updated.title.value_or(""), std::string("second"));
+    eq("update persists", store.get_user(42).session_id.value_or(""), std::string("ses_b"));
+    eq("other user untouched", store.get_user(43).session_id.has_value(), false);
+
+    store.remember(42, "ses_a", "first");
+    store.remember(42, "ses_b", "second");
+    const auto ids = store.conversation_ids(42);
+    eq("both conversations tracked", ids.size(), std::size_t{2});
+    eq("most recent first", ids.empty() ? std::string() : ids[0], std::string("ses_b"));
+    store.forget(42, "ses_a");
+    eq("forget removes one", store.conversation_ids(42).size(), std::size_t{1});
+    store.forget(42, "ses_b");
+    eq("forget removes the rest", store.conversation_ids(42).size(), std::size_t{0});
+
+    // Nullable titles survive a round trip.
+    store.remember(42, "ses_c", std::nullopt);
+    eq("null title accepted", store.conversation_ids(42).size(), std::size_t{1});
+
+    // model_label / has_model edge cases.
+    engine::UserState edge;
+    edge.model_id = "";
+    eq("empty model id labels default", edge.model_label(), std::string("default"));
+    edge.model_id = "gemini";
+    edge.provider_id = "";
+    eq("empty provider is not has_model", edge.has_model(), false);
+    edge.variant = "default";
+    eq("default variant is omitted", edge.model_label(), std::string("/gemini"));
+    edge.provider_id = "google";
+    edge.variant = "low";
+    eq("variant is appended", edge.model_label(), std::string("google/gemini \u00b7 low"));
+    eq("has_model with both set", edge.has_model(), true);
+}
+
 }  // namespace
 
 int main() {
     test_text();
     test_sse();
+    test_store();
 
     std::printf("\n%s\n", std::string(40, '=').c_str());
     if (failures != 0) {

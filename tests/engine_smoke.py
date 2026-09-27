@@ -48,6 +48,8 @@ def test_engine_module() -> None:
     required = [
         "LIMIT",
         "SSEParser",
+        "Store",
+        "UserState",
         "clip",
         "duration",
         "human_cost",

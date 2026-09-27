@@ -2,12 +2,16 @@
 #include <pybind11/stl.h>
 
 #include <cstddef>
+#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "sse.hpp"
+#include "store.hpp"
 #include "text.hpp"
 
 namespace py = pybind11;
@@ -207,4 +211,84 @@ PYBIND11_MODULE(_engine, m) {
                 return out;
             },
             py::arg("chunk"), "Add bytes and return every event completed by them.");
+
+    // ----------------------------------------------------------------- store
+
+    py::class_<engine::UserState>(m, "UserState",
+                                  "Per-user chat state: the active conversation plus the "
+                                  "model / effort / agent preferences.")
+        .def(py::init([](long long user_id, std::optional<std::string> session_id,
+                         std::optional<std::string> provider_id, std::optional<std::string> model_id,
+                         std::optional<std::string> variant, std::optional<std::string> agent,
+                         std::optional<std::string> directory, std::optional<std::string> title) {
+                 engine::UserState state;
+                 state.user_id = user_id;
+                 state.session_id = std::move(session_id);
+                 state.provider_id = std::move(provider_id);
+                 state.model_id = std::move(model_id);
+                 state.variant = std::move(variant);
+                 state.agent = std::move(agent);
+                 state.directory = std::move(directory);
+                 state.title = std::move(title);
+                 return state;
+             }),
+             py::arg("user_id"), py::arg("session_id") = std::nullopt,
+             py::arg("provider_id") = std::nullopt, py::arg("model_id") = std::nullopt,
+             py::arg("variant") = std::nullopt, py::arg("agent") = std::nullopt,
+             py::arg("directory") = std::nullopt, py::arg("title") = std::nullopt)
+        .def_readwrite("user_id", &engine::UserState::user_id)
+        .def_readwrite("session_id", &engine::UserState::session_id)
+        .def_readwrite("provider_id", &engine::UserState::provider_id)
+        .def_readwrite("model_id", &engine::UserState::model_id)
+        .def_readwrite("variant", &engine::UserState::variant)
+        .def_readwrite("agent", &engine::UserState::agent)
+        .def_readwrite("directory", &engine::UserState::directory)
+        .def_readwrite("title", &engine::UserState::title)
+        .def_property_readonly("has_model", &engine::UserState::has_model)
+        .def_property_readonly("model_label", &engine::UserState::model_label)
+        .def("__repr__", [](const engine::UserState& self) {
+            return "UserState(user_id=" + std::to_string(self.user_id) + ", model=" +
+                   self.model_label() + ")";
+        });
+
+    py::class_<engine::Store>(m, "Store", "SQLite persistence for per-user chat state.")
+        .def(
+            py::init([](py::object path) {
+                // The original accepted str | Path and called str() on it.
+                return std::make_unique<engine::Store>(py::cast<std::string>(py::str(path)));
+            }),
+            py::arg("path"))
+        .def_property_readonly("path", &engine::Store::path)
+        .def("get_user", &engine::Store::get_user, py::arg("user_id"))
+        .def("save_user", &engine::Store::save_user, py::arg("state"))
+        .def(
+            "update",
+            [](engine::Store& self, long long user_id, const py::kwargs& fields) {
+                std::vector<std::pair<std::string, std::optional<std::string>>> converted;
+                converted.reserve(fields.size());
+                for (auto item : fields) {
+                    const auto name = py::cast<std::string>(item.first);
+                    if (item.second.is_none()) {
+                        converted.emplace_back(name, std::nullopt);
+                    } else {
+                        converted.emplace_back(name, py::cast<std::string>(item.second));
+                    }
+                }
+                return self.update(user_id, converted);
+            },
+            py::arg("user_id"))
+        .def(
+            "remember",
+            [](engine::Store& self, long long user_id, std::string session_id, py::object title) {
+                std::optional<std::string> converted;
+                if (!title.is_none()) {
+                    converted = py::cast<std::string>(title);
+                }
+                self.remember(user_id, session_id, converted);
+            },
+            py::arg("user_id"), py::arg("session_id"), py::arg("title") = py::none())
+        .def("conversation_ids", &engine::Store::conversation_ids, py::arg("user_id"),
+             py::arg("limit") = 200)
+        .def("forget", &engine::Store::forget, py::arg("user_id"), py::arg("session_id"))
+        .def("close", &engine::Store::close);
 }

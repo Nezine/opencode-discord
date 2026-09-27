@@ -32,6 +32,7 @@ find_package(Threads REQUIRED)
 set(ENGINE_SOURCES
   cpp/bindings.cpp
   cpp/sse.cpp
+  cpp/store.cpp
   cpp/text.cpp
 )
 
@@ -66,6 +67,7 @@ set_target_properties(_engine PROPERTIES
 add_executable(engine_tests
   cpp/engine_tests.cpp
   cpp/sse.cpp
+  cpp/store.cpp
   cpp/text.cpp
 )
 
@@ -73,6 +75,8 @@ target_include_directories(engine_tests PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
 )
+
+target_link_libraries(engine_tests PRIVATE SQLite3::SQLite3)
 
 target_compile_options(engine_tests PRIVATE -Wall -Wextra -Wpedantic)
 if(ENGINE_WERROR)
