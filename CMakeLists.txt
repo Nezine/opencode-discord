@@ -31,6 +31,7 @@ find_package(Threads REQUIRED)
 
 set(ENGINE_SOURCES
   cpp/bindings.cpp
+  cpp/client.cpp
   cpp/config.cpp
   cpp/sse.cpp
   cpp/store.cpp
@@ -68,6 +69,7 @@ set_target_properties(_engine PROPERTIES
 # it without instrumenting the extension module the bot loads.
 add_executable(engine_tests
   cpp/engine_tests.cpp
+  cpp/client.cpp
   cpp/config.cpp
   cpp/sse.cpp
   cpp/store.cpp
@@ -80,7 +82,7 @@ target_include_directories(engine_tests PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
 )
 
-target_link_libraries(engine_tests PRIVATE SQLite3::SQLite3)
+target_link_libraries(engine_tests PRIVATE SQLite3::SQLite3 CURL::libcurl)
 
 target_compile_options(engine_tests PRIVATE -Wall -Wextra -Wpedantic)
 if(ENGINE_WERROR)

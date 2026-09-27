@@ -1,3 +1,4 @@
+#include <pybind11/eval.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -9,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "client.hpp"
 #include "config.hpp"
 #include "json.hpp"
 
@@ -128,6 +130,33 @@ py::object state_dir() {
 
 py::object cache_dir() {
     return xdg_dir("XDG_CACHE_HOME", ".cache").attr("joinpath")("opencode-discord");
+}
+
+// Run a blocking native call with the GIL released, so Python drives the
+// transport from a worker thread without stalling the event loop.
+template <typename Fn>
+auto without_gil(Fn&& fn) {
+    py::gil_scoped_release release;
+    return fn();
+}
+
+std::optional<std::string> opt_str(const py::object& value) {
+    if (!value || value.is_none()) {
+        return std::nullopt;
+    }
+    return py::cast<std::string>(value);
+}
+
+py::list json_list(const std::vector<engine::Json>& values) {
+    py::list out(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        out[i] = json_to_py(values[i]);
+    }
+    return out;
+}
+
+py::object json_opt(const std::optional<engine::Json>& value) {
+    return value.has_value() ? json_to_py(*value) : py::none();
 }
 
 }  // namespace
@@ -489,4 +518,260 @@ PYBIND11_MODULE(_engine, m) {
         const engine::ServiceEndpoint endpoint = engine::discover_service();
         return py::make_tuple(endpoint.url, endpoint.username, endpoint.password);
     });
+
+    // ---------------------------------------------------------------- client
+
+    // The exception type is defined in Python here so it keeps the original's
+    // constructor, attributes and not_found/conflict properties; the transport
+    // raises it through the translator below.
+    py::exec(R"py(
+class OpenCodeError(RuntimeError):
+    """An error returned by the OpenCode service."""
+
+    def __init__(self, status, message, payload=None):
+        super().__init__(f"[{status}] {message}")
+        self.status = status
+        self.message = message
+        self.payload = payload
+
+    @property
+    def not_found(self):
+        return self.status == 404
+
+    @property
+    def conflict(self):
+        return self.status == 409
+)py",
+             m.attr("__dict__"));
+
+    py::register_exception_translator([](std::exception_ptr error) {
+        try {
+            if (error) {
+                std::rethrow_exception(error);
+            }
+        } catch (const engine::HttpError& http_error) {
+            const py::object type = py::module_::import("bot._engine").attr("OpenCodeError");
+            py::object payload = py::none();
+            if (http_error.payload().has_value()) {
+                payload = json_to_py(*http_error.payload());
+            }
+            const py::tuple args =
+                py::make_tuple(http_error.status(), http_error.message(), payload);
+            PyErr_SetObject(type.ptr(), args.ptr());
+        }
+    });
+
+    py::class_<engine::OpenCodeClient>(
+        m, "OpenCodeClient",
+        "Blocking HTTP + SSE transport for the OpenCode API. Requests release the GIL; the\n"
+        "event stream runs on its own thread and is drained with poll().")
+        .def(py::init([](std::string url, std::string username, std::string password,
+                         double timeout) {
+                 return std::make_unique<engine::OpenCodeClient>(
+                     std::move(url), std::move(username), std::move(password), timeout);
+             }),
+             py::arg("url"), py::arg("username") = "opencode", py::arg("password") = "",
+             py::arg("timeout") = 60.0)
+        .def_property_readonly("base", &engine::OpenCodeClient::base)
+        .def_property_readonly("reconnects", &engine::OpenCodeClient::reconnects)
+        .def_property_readonly("parser_largest", &engine::OpenCodeClient::parser_largest)
+        .def_property_readonly("parser_dropped", &engine::OpenCodeClient::parser_dropped)
+        .def(
+            "start",
+            [](engine::OpenCodeClient& self) {
+                return without_gil([&] { return self.start(); });
+            },
+            "Probe /api/info and start the event stream; returns the server version.")
+        .def("close", [](engine::OpenCodeClient& self) { without_gil([&] { self.close(); }); })
+        .def(
+            "poll",
+            [](engine::OpenCodeClient& self, std::size_t max_n, long long timeout_ms) {
+                auto events = without_gil([&] { return self.poll(max_n, timeout_ms); });
+                return json_list(events);
+            },
+            py::arg("max_n") = 256, py::arg("timeout_ms") = 250)
+        .def(
+            "list_sessions",
+            [](engine::OpenCodeClient& self, long long limit, const py::object& cursor,
+               const py::object& directory, const py::object& search, std::string order) {
+                auto result = without_gil([&] {
+                    return self.list_sessions(limit, opt_str(cursor), opt_str(directory),
+                                              opt_str(search), order);
+                });
+                return py::make_tuple(json_list(result.first), json_to_py(result.second));
+            },
+            py::arg("limit") = 50, py::arg("cursor") = py::none(),
+            py::arg("directory") = py::none(), py::arg("search") = py::none(),
+            py::arg("order") = "desc")
+        .def(
+            "create_session",
+            [](engine::OpenCodeClient& self, const py::object& title, const py::object& agent,
+               const py::object& model, const py::object& directory) {
+                auto result = without_gil([&] {
+                    return self.create_session(opt_str(title), opt_str(agent),
+                                               model.is_none() ? std::nullopt
+                                                               : std::optional<engine::Json>(
+                                                                     py_to_json(model)),
+                                               opt_str(directory));
+                });
+                return json_to_py(result);
+            },
+            py::arg("title") = py::none(), py::arg("agent") = py::none(),
+            py::arg("model") = py::none(), py::arg("directory") = py::none())
+        .def(
+            "get_session",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                auto result = without_gil([&] { return self.get_session(session_id); });
+                return json_to_py(result);
+            },
+            py::arg("session_id"))
+        .def(
+            "update_session",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const py::object& title) {
+                auto result = without_gil([&] { return self.update_session(session_id, opt_str(title)); });
+                return json_opt(result);
+            },
+            py::arg("session_id"), py::arg("title") = py::none())
+        .def(
+            "delete_session",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                without_gil([&] { self.delete_session(session_id); });
+            },
+            py::arg("session_id"))
+        .def(
+            "fork_session",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const py::object& before) {
+                auto result = without_gil([&] { return self.fork_session(session_id, opt_str(before)); });
+                return json_to_py(result);
+            },
+            py::arg("session_id"), py::arg("before") = py::none())
+        .def(
+            "set_model",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& provider_id, const std::string& model_id,
+               const py::object& variant) {
+                without_gil([&] {
+                    self.set_model(session_id, provider_id, model_id, opt_str(variant));
+                });
+            },
+            py::arg("session_id"), py::arg("provider_id"), py::arg("model_id"),
+            py::arg("variant") = py::none())
+        .def(
+            "set_agent",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& agent) {
+                without_gil([&] { self.set_agent(session_id, agent); });
+            },
+            py::arg("session_id"), py::arg("agent"))
+        .def(
+            "prompt",
+            [](engine::OpenCodeClient& self, const std::string& session_id, const std::string& text,
+               const py::object& files, const py::object& delivery) {
+                auto result = without_gil([&] {
+                    return self.prompt(session_id, text,
+                                       files.is_none()
+                                           ? std::nullopt
+                                           : std::optional<engine::Json>(py_to_json(files)),
+                                       opt_str(delivery));
+                });
+                return json_to_py(result);
+            },
+            py::arg("session_id"), py::arg("text"), py::arg("files") = py::none(),
+            py::arg("delivery") = py::none())
+        .def(
+            "messages",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                auto result = without_gil([&] { return self.messages(session_id); });
+                return json_list(result);
+            },
+            py::arg("session_id"))
+        .def(
+            "message",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& message_id) {
+                auto result = without_gil([&] { return self.message(session_id, message_id); });
+                return json_to_py(result);
+            },
+            py::arg("session_id"), py::arg("message_id"))
+        .def(
+            "interrupt",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                without_gil([&] { self.interrupt(session_id); });
+            },
+            py::arg("session_id"))
+        .def(
+            "compact",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                auto result = without_gil([&] { return self.compact(session_id); });
+                return json_opt(result);
+            },
+            py::arg("session_id"))
+        .def(
+            "stage_revert",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& message_id) {
+                without_gil([&] { self.stage_revert(session_id, message_id); });
+            },
+            py::arg("session_id"), py::arg("message_id"))
+        .def(
+            "clear_revert",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                without_gil([&] { self.clear_revert(session_id); });
+            },
+            py::arg("session_id"))
+        .def(
+            "permissions",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                auto result = without_gil([&] { return self.permissions(session_id); });
+                return json_list(result);
+            },
+            py::arg("session_id"))
+        .def(
+            "reply_permission",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& request_id, const std::string& decision,
+               const py::object& message) {
+                auto result = without_gil([&] {
+                    return self.reply_permission(session_id, request_id, decision, opt_str(message));
+                });
+                return json_opt(result);
+            },
+            py::arg("session_id"), py::arg("request_id"), py::arg("decision"),
+            py::arg("message") = py::none())
+        .def(
+            "models",
+            [](engine::OpenCodeClient& self) {
+                auto result = without_gil([&] { return self.models(); });
+                return json_list(result);
+            })
+        .def(
+            "agents",
+            [](engine::OpenCodeClient& self) {
+                auto result = without_gil([&] { return self.agents(); });
+                return json_list(result);
+            })
+        .def(
+            "active_sessions",
+            [](engine::OpenCodeClient& self) {
+                auto result = without_gil([&] { return self.active_sessions(); });
+                py::dict out;
+                for (auto& [session_id, state] : result) {
+                    out[py::str(session_id)] = py::str(state);
+                }
+                return out;
+            })
+        .def(
+            "config",
+            [](engine::OpenCodeClient& self) {
+                auto result = without_gil([&] { return self.config(); });
+                return json_to_py(result);
+            })
+        .def(
+            "default_model",
+            [](engine::OpenCodeClient& self) {
+                auto result = without_gil([&] { return self.default_model(); });
+                return json_opt(result);
+            });
 }

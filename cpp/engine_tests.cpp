@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "client.hpp"
 #include "config.hpp"
 #include "sse.hpp"
 #include "store.hpp"
@@ -474,6 +475,31 @@ void test_config() {
     restore("SESSION_LIST_LIMIT", saved_limit);
 }
 
+void test_client() {
+    std::printf("\nclient\n");
+
+    // Nothing here talks to a real service: this covers the queue, the URL
+    // handling and that a dead endpoint fails instead of hanging.
+    engine::OpenCodeClient client("http://127.0.0.1:1/", "opencode", "", 2.0);
+    eq("base strips the trailing slash", client.base(), std::string("http://127.0.0.1:1"));
+    eq("no reconnects yet", client.reconnects(), 0LL);
+    eq("parser counters start at zero", client.parser_largest(), std::size_t{0});
+
+    eq("poll on a fresh client is empty", client.poll(8, 0).size(), std::size_t{0});
+
+    bool failed = false;
+    try {
+        client.get_session("ses_x");
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    eq("a dead endpoint fails cleanly", failed, true);
+
+    client.close();
+    client.close();  // close must be safe to call twice
+    eq("poll after close returns promptly", client.poll(8, 50).size(), std::size_t{0});
+}
+
 }  // namespace
 
 int main() {
@@ -482,6 +508,7 @@ int main() {
     test_store();
     test_turn();
     test_config();
+    test_client();
 
     std::printf("\n%s\n", std::string(40, '=').c_str());
     if (failures != 0) {

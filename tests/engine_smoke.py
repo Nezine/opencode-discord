@@ -49,6 +49,8 @@ def test_engine_module() -> None:
         "DEFAULT_SERVICE_URL",
         "LIMIT",
         "Config",
+        "OpenCodeClient",
+        "OpenCodeError",
         "SSEParser",
         "Step",
         "Store",
