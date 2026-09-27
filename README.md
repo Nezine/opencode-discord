@@ -16,8 +16,21 @@ bot ▸ ⏳ thinking · anthropic/claude-sonnet-4 · high
 ## Requirements
 
 - An OpenCode service reachable over HTTP (the local background service is ideal)
-- Python 3.11+
+- Python 3.11+, and its development headers
+- A C++20 toolchain: GCC 13+ or Clang 16+, CMake 3.20+, `ninja` or `make`
+- Development headers for **libcurl** and **SQLite 3**
 - A Discord application with the **Message Content Intent** enabled
+
+On Arch (what this was developed against):
+
+```sh
+sudo pacman -S base-devel cmake ninja curl sqlite
+```
+
+On Debian/Ubuntu: `sudo apt install build-essential cmake ninja-build libcurl4-openssl-dev libsqlite3-dev python3-dev`.
+
+The bot is half Python and half C++ — the OpenCode-facing engine is a native
+extension. See [ARCHITECTURE.md](ARCHITECTURE.md) for why the split falls there.
 
 ## Setup
 
@@ -45,11 +58,22 @@ print it for you.
 
 **3. Install**
 
+`pip install -e .` builds the native engine (`bot/_engine*.so`) through CMake:
+
 ```sh
 cd ~/opencode-discord
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
+
+To build just the extension, or to rebuild after editing anything in `cpp/`:
+
+```sh
+./build.sh
+```
+
+`run.sh` and `test.sh` run that for you if the extension is missing, so the
+steps below work either way.
 
 **4. Configure**
 
@@ -178,19 +202,35 @@ care about.
 
 ## Layout
 
+The OpenCode-facing half lives in C++ (`cpp/`, built into `bot/_engine*.so`); the
+Discord-facing half is Python (`bot/`). [ARCHITECTURE.md](ARCHITECTURE.md) explains
+the boundary and how the two halves talk to each other.
+
 ```
-bot/
-  main.py        entry point, DM routing, DM-only command gate
-  config.py      .env parsing, OpenCode service discovery
-  oc.py          async OpenCode API client + event (SSE) bus
-  service.py     shared state: client, store, per-user conversations
-  runner.py      per-user conversation state machine, turn orchestration
-  turn.py        event -> renderable state (text, tools, reasoning)
-  messaging.py   send/edit helpers, throttled live messages
-  ui.py          select menus, buttons, embeds
-  store.py       SQLite: active session, model/effort prefs, history
-  textutil.py    Discord-safe chunking and formatting
-tests/           see below
+cpp/               native engine (C++20)
+  client.*         OpenCode HTTP + SSE transport, stream thread
+  sse.*            byte-level SSE framing
+  turn.*           event -> renderable state (text, tools, reasoning)
+  store.*          SQLite: active session, model/effort prefs, history
+  text.*           Discord-safe chunking and formatting
+  config.*         env knobs, XDG paths, service discovery
+  jsonvalue.hpp    shared Python-truthiness / str() helpers
+  bindings.cpp     the surface Python sees
+  engine_tests.cpp standalone tests, so sanitizers can run off-Python
+
+bot/               Python: Discord, and the asyncio wiring
+  main.py          entry point, DM routing, DM-only command gate
+  runner.py        per-user conversation state machine, turn orchestration
+  service.py       shared state: client, store, per-user conversations
+  messaging.py     send/edit helpers, throttled live messages
+  ui.py            select menus, buttons, embeds
+  commands.py      slash commands
+  oc.py            async facade over the native transport + event fan-out
+  turn.py          re-export shims over the native engine
+  store.py
+  textutil.py
+  config.py
+tests/             see below
 ```
 
 State lives in `~/.local/state/opencode-discord/state.db`. Nothing is stored
@@ -204,6 +244,17 @@ the transcripts themselves stay in OpenCode's own database.
 ./test.sh --live   # plus real turns against the local OpenCode service
 ```
 
+The native engine also builds as a plain executable, so it can run under
+sanitizers without instrumenting the extension the bot loads:
+
+```sh
+./build.sh --sanitize && ./build-sanitize/engine_tests
+```
+
+- `tests/engine_smoke.py` — the extension built, imports, and exposes every name
+  the Python modules re-export
+- `tests/parser_parity.py` — the native SSE parser against a verbatim copy of the
+  original Python one, over an adversarial corpus in several chunk splittings
 - `tests/units.py` — chunking (including code-fence balance), the turn state
   machine, the SSE parser (including payloads past aiohttp's 512 KiB line
   limit), the store
