@@ -31,6 +31,7 @@ find_package(Threads REQUIRED)
 
 set(ENGINE_SOURCES
   cpp/bindings.cpp
+  cpp/config.cpp
   cpp/sse.cpp
   cpp/store.cpp
   cpp/text.cpp
@@ -67,6 +68,7 @@ set_target_properties(_engine PROPERTIES
 # it without instrumenting the extension module the bot loads.
 add_executable(engine_tests
   cpp/engine_tests.cpp
+  cpp/config.cpp
   cpp/sse.cpp
   cpp/store.cpp
   cpp/text.cpp

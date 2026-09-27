@@ -2,12 +2,14 @@
 #include <pybind11/stl.h>
 
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "config.hpp"
 #include "json.hpp"
 
 #include "sse.hpp"
@@ -100,6 +102,32 @@ engine::Json py_to_json(py::handle value) {
         return out;
     }
     return nullptr;
+}
+
+// The XDG helpers return pathlib.Path, so they are built through Python's own
+// pathlib rather than reimplementing its normalisation.
+py::object pathlib_path(const std::string& value) {
+    return py::module_::import("pathlib").attr("Path")(py::str(value));
+}
+
+py::object xdg_dir(const std::string& variable, const std::string& fallback) {
+    const char* raw = std::getenv(variable.c_str());
+    const py::object stripped = (raw != nullptr ? py::str(raw) : py::str("")).attr("strip")();
+    if (PyObject_IsTrue(stripped.ptr()) == 1) {
+        return pathlib_path(py::cast<std::string>(stripped));
+    }
+    return py::module_::import("pathlib")
+        .attr("Path")
+        .attr("home")()
+        .attr("joinpath")(fallback);
+}
+
+py::object state_dir() {
+    return xdg_dir("XDG_STATE_HOME", ".local/state").attr("joinpath")("opencode-discord");
+}
+
+py::object cache_dir() {
+    return xdg_dir("XDG_CACHE_HOME", ".cache").attr("joinpath")("opencode-discord");
 }
 
 }  // namespace
@@ -394,4 +422,71 @@ PYBIND11_MODULE(_engine, m) {
     m.def("render_tools", &engine::render_tools, py::arg("step"), py::arg("limit") = 300);
     m.def("render_footer", &engine::render_footer, py::arg("state"), py::arg("step"),
           py::arg("model_label") = "");
+
+    // ---------------------------------------------------------------- config
+
+    m.attr("DEFAULT_SERVICE_URL") = engine::DEFAULT_SERVICE_URL;
+
+    py::class_<engine::Config>(m, "Config",
+                               "Runtime configuration: env knobs, their defaults and the "
+                               "fail-closed startup checks.")
+        .def_readwrite("discord_token", &engine::Config::discord_token)
+        .def_readwrite("allow_any_user", &engine::Config::allow_any_user)
+        .def_readwrite("allowlist_hint", &engine::Config::allowlist_hint)
+        .def_readwrite("opencode_url", &engine::Config::opencode_url)
+        .def_readwrite("opencode_username", &engine::Config::opencode_username)
+        .def_readwrite("opencode_password", &engine::Config::opencode_password)
+        .def_readwrite("opencode_directory", &engine::Config::opencode_directory)
+        .def_readwrite("default_model", &engine::Config::default_model)
+        .def_readwrite("default_effort", &engine::Config::default_effort)
+        .def_readwrite("default_agent", &engine::Config::default_agent)
+        .def_readwrite("steer_when_busy", &engine::Config::steer_when_busy)
+        .def_readwrite("edit_interval", &engine::Config::edit_interval)
+        .def_readwrite("turn_timeout", &engine::Config::turn_timeout)
+        .def_readwrite("stall_timeout", &engine::Config::stall_timeout)
+        .def_readwrite("show_tools", &engine::Config::show_tools)
+        .def_readwrite("show_reasoning", &engine::Config::show_reasoning)
+        .def_readwrite("session_list_limit", &engine::Config::session_list_limit)
+        .def_readwrite("attachment_dir", &engine::Config::attachment_dir)
+        .def_property(
+            "allowed_user_ids",
+            [](const engine::Config& self) {
+                py::set out;
+                for (const long long id : self.allowed_user_ids) {
+                    out.add(py::int_(id));
+                }
+                return out;
+            },
+            [](engine::Config& self, const py::object& value) {
+                self.allowed_user_ids.clear();
+                for (py::handle item : value) {
+                    self.allowed_user_ids.insert(py::cast<long long>(item));
+                }
+            })
+        .def("allowed", &engine::Config::allowed, py::arg("user_id"))
+        .def_static("from_env", []() {
+            engine::Config cfg = [] {
+                try {
+                    return engine::config_from_env();
+                } catch (const engine::ConfigError& exc) {
+                    // The original raises SystemExit for these two checks.
+                    PyErr_SetString(PyExc_SystemExit, exc.what());
+                    throw py::error_already_set();
+                }
+            }();
+            if (cfg.attachment_dir.empty()) {
+                cfg.attachment_dir = py::cast<std::string>(
+                    py::str(cache_dir().attr("joinpath")("attachments")));
+            }
+            return cfg;
+        });
+
+    m.def("xdg_dir", &xdg_dir, py::arg("variable"), py::arg("default"));
+    m.def("state_dir", &state_dir);
+    m.def("cache_dir", &cache_dir);
+
+    m.def("discover_service", []() {
+        const engine::ServiceEndpoint endpoint = engine::discover_service();
+        return py::make_tuple(endpoint.url, endpoint.username, endpoint.password);
+    });
 }

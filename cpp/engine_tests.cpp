@@ -9,9 +9,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "config.hpp"
 #include "sse.hpp"
 #include "store.hpp"
 #include "text.hpp"
@@ -364,6 +367,113 @@ void test_turn() {
           engine::render_footer(footer, *fstep, "m/x").find("$1.50") != std::string::npos);
 }
 
+void test_config() {
+    std::printf("\nconfig\n");
+
+    const auto save = [](const char* name) -> std::optional<std::string> {
+        const char* raw = std::getenv(name);
+        return raw != nullptr ? std::optional<std::string>(raw) : std::nullopt;
+    };
+    const auto restore = [](const char* name, const std::optional<std::string>& value) {
+        if (value.has_value()) {
+            ::setenv(name, value->c_str(), 1);
+        } else {
+            ::unsetenv(name);
+        }
+    };
+
+    const auto saved_token = save("DISCORD_TOKEN");
+    const auto saved_users = save("DISCORD_USER_IDS");
+    const auto saved_any = save("ALLOW_ANY_USER");
+    const auto saved_show = save("SHOW_TOOLS");
+    const auto saved_interval = save("EDIT_INTERVAL");
+    const auto saved_limit = save("SESSION_LIST_LIMIT");
+    const auto saved_url = save("OPENCODE_URL");
+    const auto saved_user = save("OPENCODE_USERNAME");
+    const auto saved_password = save("OPENCODE_PASSWORD");
+
+    const auto raises = [](const std::string& needle) {
+        try {
+            engine::config_from_env();
+        } catch (const engine::ConfigError& exc) {
+            return std::string(exc.what()).find(needle) != std::string::npos;
+        }
+        return false;
+    };
+
+    // Fail-closed: no token, then no allowlist.
+    ::unsetenv("DISCORD_TOKEN");
+    ::unsetenv("DISCORD_USER_IDS");
+    ::unsetenv("ALLOW_ANY_USER");
+    eq("missing token refused", raises("DISCORD_TOKEN"), true);
+
+    ::setenv("DISCORD_TOKEN", "tok", 1);
+    eq("empty whitelist refused", raises("DISCORD_USER_IDS"), true);
+
+    ::setenv("DISCORD_USER_IDS", "1 2,3", 1);
+    const engine::Config cfg = engine::config_from_env();
+    eq("comma and space separated ids parsed", cfg.allowed_user_ids.size(), std::size_t{3});
+    eq("member allowed", cfg.allowed(1), true);
+    eq("stranger refused", cfg.allowed(4), false);
+    eq("url default", cfg.opencode_url, std::string("http://127.0.0.1:4096"));
+    eq("agent default", cfg.default_agent, std::string("build"));
+    eq("username default", cfg.opencode_username, std::string("opencode"));
+    eq("directory falls back to home", cfg.opencode_directory.empty(), false);
+
+    // Non-digits in the allowlist are dropped rather than raising.
+    ::setenv("DISCORD_USER_IDS", "7,-9,abc,+5", 1);
+    eq("only plain digits kept", engine::config_from_env().allowed_user_ids.size(), std::size_t{1});
+
+    ::setenv("DISCORD_USER_IDS", "", 1);
+    ::setenv("ALLOW_ANY_USER", "1", 1);
+    eq("allow any user works", engine::config_from_env().allowed(4), true);
+    ::unsetenv("ALLOW_ANY_USER");
+
+    // Defaults and tolerant parsing.
+    ::setenv("DISCORD_USER_IDS", "42", 1);
+    ::unsetenv("SHOW_TOOLS");
+    ::unsetenv("EDIT_INTERVAL");
+    ::setenv("SESSION_LIST_LIMIT", "not-a-number", 1);
+    const engine::Config defaults = engine::config_from_env();
+    eq("show_tools default", defaults.show_tools, true);
+    eq("show_reasoning default", defaults.show_reasoning, false);
+    eq("edit_interval default", defaults.edit_interval, 1.5);
+    eq("bad int falls back to default", defaults.session_list_limit, 100LL);
+
+    ::setenv("SHOW_TOOLS", "", 1);
+    eq("empty bool is false", engine::config_from_env().show_tools, false);
+    ::setenv("SHOW_TOOLS", "YES", 1);
+    eq("bool is case-insensitive", engine::config_from_env().show_tools, true);
+
+    ::setenv("SESSION_LIST_LIMIT", " 17 ", 1);
+    eq("int tolerates whitespace", engine::env_int("SESSION_LIST_LIMIT", 0), 17LL);
+    ::setenv("SESSION_LIST_LIMIT", "17x", 1);
+    eq("int rejects trailing junk", engine::env_int("SESSION_LIST_LIMIT", 0), 0LL);
+    ::setenv("EDIT_INTERVAL", "  2.25", 1);
+    eq("float parses", engine::env_float("EDIT_INTERVAL", 0.0), 2.25);
+    ::unsetenv("EDIT_INTERVAL");
+    eq("float falls back", engine::env_float("EDIT_INTERVAL", 9.5), 9.5);
+
+    // discover_service: the environment always wins.
+    ::setenv("OPENCODE_URL", "http://example.test:1", 1);
+    ::setenv("OPENCODE_USERNAME", "someone", 1);
+    ::setenv("OPENCODE_PASSWORD", "secret", 1);
+    const engine::ServiceEndpoint endpoint = engine::discover_service();
+    eq("env url wins", endpoint.url, std::string("http://example.test:1"));
+    eq("env username wins", endpoint.username, std::string("someone"));
+    eq("env password wins", endpoint.password, std::string("secret"));
+
+    restore("OPENCODE_URL", saved_url);
+    restore("OPENCODE_USERNAME", saved_user);
+    restore("OPENCODE_PASSWORD", saved_password);
+    restore("DISCORD_TOKEN", saved_token);
+    restore("DISCORD_USER_IDS", saved_users);
+    restore("ALLOW_ANY_USER", saved_any);
+    restore("SHOW_TOOLS", saved_show);
+    restore("EDIT_INTERVAL", saved_interval);
+    restore("SESSION_LIST_LIMIT", saved_limit);
+}
+
 }  // namespace
 
 int main() {
@@ -371,6 +481,7 @@ int main() {
     test_sse();
     test_store();
     test_turn();
+    test_config();
 
     std::printf("\n%s\n", std::string(40, '=').c_str());
     if (failures != 0) {

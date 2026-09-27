@@ -46,7 +46,9 @@ def test_engine_module() -> None:
     # Everything bot/*.py re-exports must exist here, or the shims break at import
     # time in whichever suite touches them first.
     required = [
+        "DEFAULT_SERVICE_URL",
         "LIMIT",
+        "Config",
         "SSEParser",
         "Step",
         "Store",
@@ -54,7 +56,9 @@ def test_engine_module() -> None:
         "TurnState",
         "UserState",
         "apply_event",
+        "cache_dir",
         "clip",
+        "discover_service",
         "duration",
         "human_cost",
         "human_tokens",
@@ -67,7 +71,9 @@ def test_engine_module() -> None:
         "render_tools",
         "sanitize_mentions",
         "split_text",
+        "state_dir",
         "tool_detail",
+        "xdg_dir",
     ]
     missing = [name for name in required if not hasattr(_engine, name)]
     check("exposes the expected API", not missing, f"\n       missing: {missing}")
