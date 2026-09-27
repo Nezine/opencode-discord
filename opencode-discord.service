@@ -1,0 +1,41 @@
+[Unit]
+Description=OpenCode Discord bridge (DM chat with a local OpenCode session)
+Documentation=file:%h/opencode-discord/README.md
+After=network-online.target
+Wants=network-online.target
+# Never give up: if the bot, or the OpenCode service it depends on, is down,
+# keep retrying instead of parking in a failed state.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/opencode-discord
+EnvironmentFile=%h/opencode-discord/.env
+# The bot discovers the OpenCode service with the `opencode` CLI on start-up, and
+# it may need to start that service itself after a reboot.
+ExecStartPre=%h/opencode-discord/ensure-opencode.sh
+ExecStart=%h/opencode-discord/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+# A crashed turn should not take the process down mid-reply.
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# systemd creates these with the right ownership and makes them writable even
+# under ProtectSystem=strict, which is why the bot keeps its state under XDG paths.
+StateDirectory=opencode-discord
+CacheDirectory=opencode-discord
+
+# Hardening. Note that the bot process is only a proxy: the code execution this
+# bot authorises happens inside the separate OpenCode service, which this unit
+# does not sandbox. The writable paths below are the ones the bot genuinely needs
+# — its own state, and OpenCode's registry so it can find (and start) its
+# dependency. Restricting them any further breaks start-up, because the bot then
+# cannot discover the service's port and falls back to a default that is wrong.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/opencode %h/.config/opencode
+
+[Install]
+WantedBy=default.target

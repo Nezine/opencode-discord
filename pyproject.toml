@@ -1,0 +1,19 @@
+[project]
+name = "opencode-discord"
+version = "1.0.0"
+description = "Chat with OpenCode from Discord DMs, with conversation history, model and effort controls"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.4",
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+opencode-discord = "bot.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bot"]
