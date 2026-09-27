@@ -43,4 +43,8 @@ std::string human_cost(std::optional<double> cost);
 // `total` is an already-summed token count.
 std::string format_tokens(long long total);
 
+// Join the truthy (non-empty) parts with a separator.
+std::string join_nonempty(const std::vector<std::string>& parts,
+                          std::string_view sep = " \u00b7 ");
+
 }  // namespace text

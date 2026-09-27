@@ -14,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "json.hpp"
 
 namespace engine {
 
@@ -29,10 +29,10 @@ public:
     std::size_t largest = 0;  // code points of the largest data payload seen
 
     // Add bytes and return every event completed by them.
-    std::vector<nlohmann::json> feed(std::string_view chunk);
+    std::vector<Json> feed(std::string_view chunk);
 
 private:
-    std::optional<nlohmann::json> parse_line(std::string_view raw);
+    std::optional<Json> parse_line(std::string_view raw);
 
     std::string buffer_;
     std::optional<std::string> name_;

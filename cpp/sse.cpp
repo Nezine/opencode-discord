@@ -33,9 +33,9 @@ std::string strip(std::string_view value) {
 
 }  // namespace
 
-std::vector<nlohmann::json> SseParser::feed(std::string_view chunk) {
+std::vector<Json> SseParser::feed(std::string_view chunk) {
     buffer_.append(chunk);
-    std::vector<nlohmann::json> events;
+    std::vector<Json> events;
 
     while (true) {
         const std::size_t index = buffer_.find('\n');
@@ -64,7 +64,7 @@ std::vector<nlohmann::json> SseParser::feed(std::string_view chunk) {
     return events;
 }
 
-std::optional<nlohmann::json> SseParser::parse_line(std::string_view raw) {
+std::optional<Json> SseParser::parse_line(std::string_view raw) {
     const std::string line = decode_and_trim_cr(raw);
     if (line.empty()) {
         return std::nullopt;
@@ -85,10 +85,10 @@ std::optional<nlohmann::json> SseParser::parse_line(std::string_view raw) {
 
     largest = std::max(largest, utf8::decode(data).size());
 
-    nlohmann::json event;
+    Json event;
     try {
-        event = nlohmann::json::parse(data);
-    } catch (const nlohmann::json::exception&) {
+        event = Json::parse(data);
+    } catch (const Json::exception&) {
         return std::nullopt;
     }
     if (!event.is_object()) {

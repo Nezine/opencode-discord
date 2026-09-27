@@ -329,4 +329,18 @@ std::string format_tokens(long long total) {
     return std::to_string(total) + " tokens";
 }
 
+std::string join_nonempty(const std::vector<std::string>& parts, std::string_view sep) {
+    std::string out;
+    for (const auto& part : parts) {
+        if (part.empty()) {
+            continue;
+        }
+        if (!out.empty()) {
+            out += sep;
+        }
+        out += part;
+    }
+    return out;
+}
+
 }  // namespace text

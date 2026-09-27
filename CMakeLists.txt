@@ -34,6 +34,7 @@ set(ENGINE_SOURCES
   cpp/sse.cpp
   cpp/store.cpp
   cpp/text.cpp
+  cpp/turn.cpp
 )
 
 pybind11_add_module(_engine ${ENGINE_SOURCES})
@@ -69,6 +70,7 @@ add_executable(engine_tests
   cpp/sse.cpp
   cpp/store.cpp
   cpp/text.cpp
+  cpp/turn.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

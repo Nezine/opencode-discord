@@ -184,6 +184,16 @@ inline std::vector<std::vector<char32_t>> split_lines(const std::vector<char32_t
     return out;
 }
 
+// Python's s[:limit] for str: cut on a code-point boundary, no ellipsis.
+inline std::string truncate(std::string_view value, std::size_t limit) {
+    auto cps = decode(value);
+    if (cps.size() <= limit) {
+        return std::string(value);
+    }
+    cps.resize(limit);
+    return encode(cps);
+}
+
 inline void rstrip_in_place(std::vector<char32_t>& cps) {
     while (!cps.empty() && is_space(cps.back())) {
         cps.pop_back();

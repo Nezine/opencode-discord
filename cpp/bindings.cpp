@@ -8,21 +8,22 @@
 #include <utility>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "json.hpp"
 
 #include "sse.hpp"
 #include "store.hpp"
 #include "text.hpp"
+#include "turn.hpp"
 
 namespace py = pybind11;
 
 namespace {
 
-// nlohmann::json -> plain Python objects. Callers poke these with dict.get(),
+// engine::Json -> plain Python objects. Callers poke these with dict.get(),
 // isinstance() and truthiness, so they must be real dict/list/scalars and not
 // wrapper types.
-py::object json_to_py(const nlohmann::json& value) {
-    using value_t = nlohmann::json::value_t;
+py::object json_to_py(const engine::Json& value) {
+    using value_t = engine::Json::value_t;
     switch (value.type()) {
         case value_t::null:
             return py::none();
@@ -65,33 +66,40 @@ std::string as_text(py::handle value) {
     return py::cast<std::string>(value);
 }
 
-// `mapping.get(key)` when the object has one, else None -- mirrors how the
-// Python helpers probe these payloads.
-py::object mapping_get(py::handle mapping, const char* key) {
-    if (!mapping || !py::hasattr(mapping, "get")) {
-        return py::none();
+// Python -> JSON for the event and message payloads the turn state machine
+// consumes. These always originate as JSON, so anything unrecognised degrades to
+// null rather than raising.
+engine::Json py_to_json(py::handle value) {
+    if (!value || value.is_none()) {
+        return nullptr;
     }
-    try {
-        return mapping.attr("get")(py::str(key));
-    } catch (const py::error_already_set&) {
-        return py::none();
+    if (PyBool_Check(value.ptr())) {
+        return value.ptr() == Py_True;
     }
-}
-
-// Python's `int(value or 0)` wrapped in `except (TypeError, ValueError): pass`.
-void add_token_count(py::handle mapping, const char* key, long long& total) {
-    const py::object value = mapping_get(mapping, key);
-    if (!value || PyObject_IsTrue(value.ptr()) != 1) {
-        return;
+    if (PyLong_Check(value.ptr())) {
+        return py::cast<long long>(value);
     }
-    try {
-        const py::object coerced = py::reinterpret_steal<py::object>(PyNumber_Long(value.ptr()));
-        if (coerced) {
-            total += py::cast<long long>(coerced);
+    if (PyFloat_Check(value.ptr())) {
+        return py::cast<double>(value);
+    }
+    if (PyUnicode_Check(value.ptr())) {
+        return py::cast<std::string>(value);
+    }
+    if (PyDict_Check(value.ptr())) {
+        engine::Json out = engine::Json::object();
+        for (auto item : py::reinterpret_borrow<py::dict>(value)) {
+            out[py::cast<std::string>(item.first)] = py_to_json(item.second);
         }
-    } catch (const py::error_already_set&) {
-        PyErr_Clear();
+        return out;
     }
+    if (PyList_Check(value.ptr()) || PyTuple_Check(value.ptr())) {
+        engine::Json out = engine::Json::array();
+        for (auto item : value) {
+            out.push_back(py_to_json(item));
+        }
+        return out;
+    }
+    return nullptr;
 }
 
 }  // namespace
@@ -151,20 +159,8 @@ PYBIND11_MODULE(_engine, m) {
     m.def(
         "human_tokens",
         [](py::object tokens) -> std::string {
-            if (!tokens || PyObject_IsTrue(tokens.ptr()) != 1) {
-                return text::format_tokens(0);
-            }
-            long long total = 0;
-            for (const char* key : {"input", "output", "reasoning"}) {
-                add_token_count(tokens, key, total);
-            }
-            const py::object cache = mapping_get(tokens, "cache");
-            if (cache && PyObject_IsTrue(cache.ptr()) == 1) {
-                for (const char* key : {"read", "write"}) {
-                    add_token_count(cache, key, total);
-                }
-            }
-            return text::format_tokens(total);
+            // Shares token_total() with render_footer, so the two cannot drift.
+            return text::format_tokens(engine::token_total(py_to_json(tokens)));
         },
         py::arg("tokens"));
 
@@ -203,7 +199,7 @@ PYBIND11_MODULE(_engine, m) {
         .def(
             "feed",
             [](engine::SseParser& self, const std::string& chunk) {
-                std::vector<nlohmann::json> events = self.feed(chunk);
+                std::vector<engine::Json> events = self.feed(chunk);
                 py::list out(events.size());
                 for (std::size_t i = 0; i < events.size(); ++i) {
                     out[i] = json_to_py(events[i]);
@@ -291,4 +287,111 @@ PYBIND11_MODULE(_engine, m) {
              py::arg("limit") = 200)
         .def("forget", &engine::Store::forget, py::arg("user_id"), py::arg("session_id"))
         .def("close", &engine::Store::close);
+
+    // ------------------------------------------------------------------ turn
+
+    py::class_<engine::ToolActivity, std::shared_ptr<engine::ToolActivity>>(
+        m, "ToolActivity", "One tool call observed during a turn.")
+        .def_readwrite("call_id", &engine::ToolActivity::call_id)
+        .def_readwrite("name", &engine::ToolActivity::name)
+        .def_readwrite("status", &engine::ToolActivity::status)
+        .def_readwrite("detail", &engine::ToolActivity::detail)
+        .def_readwrite("error", &engine::ToolActivity::error)
+        .def_property_readonly("icon", &engine::ToolActivity::icon)
+        .def("label", &engine::ToolActivity::label);
+
+    py::class_<engine::Step, std::shared_ptr<engine::Step>>(
+        m, "Step", "One model step: interleaved text, reasoning and tool calls.")
+        .def_readwrite("message_id", &engine::Step::message_id)
+        .def_readwrite("finished", &engine::Step::finished)
+        .def_readwrite("finish", &engine::Step::finish)
+        .def_readwrite("error", &engine::Step::error)
+        .def_readwrite("cost", &engine::Step::cost)
+        .def_readwrite("started", &engine::Step::started)
+        // Live ToolActivity handles, keyed by call id, in call order. Sharing
+        // ownership means a caller that holds one keeps seeing later mutations.
+        .def_property_readonly("tools",
+                               [](const engine::Step& self) {
+                                   py::dict out;
+                                   for (const auto& [call_id, tool] : self.tools) {
+                                       out[py::str(call_id)] = tool;
+                                   }
+                                   return out;
+                               })
+        .def_property_readonly("tokens",
+                               [](const engine::Step& self) { return json_to_py(self.tokens); })
+        .def_property_readonly("text", &engine::Step::text)
+        .def_property_readonly("thinking", &engine::Step::thinking)
+        .def_property_readonly("has_text", &engine::Step::has_text)
+        .def_property_readonly("duration", &engine::Step::duration);
+
+    py::class_<engine::TurnState>(m, "TurnState",
+                                  "Accumulated state for one execution; consumes the event "
+                                  "stream and exposes renderable text and tool activity.")
+        .def(py::init([](std::string session_id) {
+                 return std::make_unique<engine::TurnState>(std::move(session_id));
+             }),
+             py::arg("session_id"))
+        .def_readwrite("session_id", &engine::TurnState::session_id)
+        .def_readwrite("cost", &engine::TurnState::cost)
+        .def_readwrite("outcome", &engine::TurnState::outcome)
+        .def_readwrite("error", &engine::TurnState::error)
+        .def_readwrite("retrying", &engine::TurnState::retrying)
+        .def_readwrite("current", &engine::TurnState::current)
+        .def_property_readonly("steps",
+                               [](const engine::TurnState& self) {
+                                   py::list out;
+                                   for (const auto& step : self.steps) {
+                                       out.append(step);
+                                   }
+                                   return out;
+                               })
+        .def_property_readonly("tokens",
+                               [](const engine::TurnState& self) { return json_to_py(self.tokens); })
+        .def_property_readonly("duration", &engine::TurnState::duration)
+        .def_property_readonly("text", &engine::TurnState::text)
+        .def_property_readonly("permissions",
+                               [](const engine::TurnState& self) {
+                                   py::dict out;
+                                   for (const auto& [key, payload] : self.permissions) {
+                                       out[py::str(key)] = json_to_py(payload);
+                                   }
+                                   return out;
+                               })
+        .def_property_readonly("pending_permissions",
+                               [](const engine::TurnState& self) {
+                                   py::dict out;
+                                   for (const auto& [key, payload] : self.permissions) {
+                                       out[py::str(key)] = json_to_py(payload);
+                                   }
+                                   return out;
+                               })
+        .def("step_for", &engine::TurnState::step_for, py::arg("message_id"))
+        .def("tool_names", &engine::TurnState::tool_names);
+
+    m.def(
+        "apply_event",
+        [](engine::TurnState& state, py::object event) { engine::apply_event(state, py_to_json(event)); },
+        py::arg("state"), py::arg("event"), "Fold one OpenCode event into the turn state.");
+
+    m.def(
+        "hydrate_from_message",
+        [](engine::TurnState& state, py::object message) {
+            engine::hydrate_from_message(state, py_to_json(message));
+        },
+        py::arg("state"), py::arg("message"),
+        "Fill in authoritative tool names/statuses from a fetched message.");
+
+    m.def(
+        "tool_detail",
+        [](py::object payload, std::size_t width) {
+            return engine::tool_detail(py_to_json(payload), width);
+        },
+        py::arg("payload"), py::arg("width") = 42);
+
+    m.def("render_status", &engine::render_status, py::arg("state"), py::arg("model_label") = "");
+    m.def("render_reasoning", &engine::render_reasoning, py::arg("text"), py::arg("limit") = 700);
+    m.def("render_tools", &engine::render_tools, py::arg("step"), py::arg("limit") = 300);
+    m.def("render_footer", &engine::render_footer, py::arg("state"), py::arg("step"),
+          py::arg("model_label") = "");
 }

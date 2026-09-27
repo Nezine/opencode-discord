@@ -48,16 +48,26 @@ def test_engine_module() -> None:
     required = [
         "LIMIT",
         "SSEParser",
+        "Step",
         "Store",
+        "ToolActivity",
+        "TurnState",
         "UserState",
+        "apply_event",
         "clip",
         "duration",
         "human_cost",
         "human_tokens",
+        "hydrate_from_message",
         "join_nonempty",
         "rel_time",
+        "render_footer",
+        "render_reasoning",
+        "render_status",
+        "render_tools",
         "sanitize_mentions",
         "split_text",
+        "tool_detail",
     ]
     missing = [name for name in required if not hasattr(_engine, name)]
     check("exposes the expected API", not missing, f"\n       missing: {missing}")

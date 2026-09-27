@@ -15,8 +15,12 @@
 #include "sse.hpp"
 #include "store.hpp"
 #include "text.hpp"
+#include "turn.hpp"
+#include "utf8.hpp"
 
 namespace {
+
+using Json = engine::Json;
 
 int failures = 0;
 
@@ -213,12 +217,160 @@ void test_store() {
     eq("has_model with both set", edge.has_model(), true);
 }
 
+void test_turn() {
+    std::printf("\nturn\n");
+
+    const auto ev = [](const std::string& kind, Json data) {
+        Json event = Json::object();
+        event["type"] = kind;
+        data["sessionID"] = "ses_test";
+        event["data"] = std::move(data);
+        return event;
+    };
+
+    // tool_detail: the key fallback iterates dict order, so an ordered object
+    // type is required or the keys come back sorted.
+    eq("tool_detail command", engine::tool_detail(Json{{"command", "ls"}}), std::string("ls"));
+    // 41 code points (width - 1) plus the ellipsis, measured in code points as
+    // Python's len() would.
+    eq("tool_detail clipped",
+       utf8::decode(engine::tool_detail(Json{{"path", std::string(200, 'x')}})).size(),
+       std::size_t{42});
+    eq("tool_detail key order", engine::tool_detail(Json{{"weird", 1}, {"other", 2}}),
+       std::string("weird,other"));
+    eq("tool_detail empty", engine::tool_detail(Json::object()), std::string(""));
+
+    eq("token_total sums",
+       engine::token_total(
+           Json{{"input", 10}, {"output", 5}, {"reasoning", 1}, {"cache", {{"read", 2}, {"write", 3}}}}),
+       21LL);
+    eq("token_total of empty", engine::token_total(Json::object()), 0LL);
+
+    engine::TurnState state("ses_test");
+    engine::apply_event(state, ev("session.step.started", {{"assistantMessageID", "msg_1"}}));
+    engine::apply_event(state,
+                        ev("session.text.started", {{"assistantMessageID", "msg_1"}, {"ordinal", 0}}));
+    engine::apply_event(state, ev("session.text.delta",
+                                  {{"assistantMessageID", "msg_1"}, {"ordinal", 0}, {"delta", "Hel"}}));
+    engine::apply_event(state, ev("session.text.delta",
+                                  {{"assistantMessageID", "msg_1"}, {"ordinal", 0}, {"delta", "lo"}}));
+    eq("deltas accumulate in order", state.text(), std::string("Hello"));
+    check("status mentions thinking",
+          engine::render_status(state, "m/x").find("thinking") != std::string::npos);
+    check("status mentions the model",
+          engine::render_status(state, "m/x").find("m/x") != std::string::npos);
+
+    engine::apply_event(state, ev("session.tool.called", {{"assistantMessageID", "msg_1"},
+                                                          {"id", "call_1"},
+                                                          {"input", {{"command", "ls -la"}}}}));
+    eq("one step tracked", state.steps.size(), std::size_t{1});
+    const auto step = state.steps.front();
+    const auto tool = step->tool("call_1");
+    check("tool was created", tool != nullptr);
+    eq("tool starts running", tool->status, std::string("running"));
+    eq("tool detail from input", tool->detail, std::string("ls -la"));
+    check("tool line rendered", engine::render_tools(*step).find("tool") != std::string::npos);
+
+    {
+        Json message = Json::object();
+        message["id"] = "msg_1";
+        message["content"] = Json::array({
+            Json{{"type", "tool"},
+                 {"id", "call_1"},
+                 {"name", "bash"},
+                 {"state", {{"status", "completed"}, {"input", {{"command", "ls"}}}}}},
+            Json{{"type", "reasoning"}, {"text", "I should list files"}},
+        });
+        engine::hydrate_from_message(state, message);
+    }
+    // The handles captured above must observe the hydration.
+    eq("tool name resolved", tool->name, std::string("bash"));
+    eq("tool status resolved", tool->status, std::string("completed"));
+    eq("reasoning hydrated", step->thinking(), std::string("I should list files"));
+    check("reasoning rendered",
+          engine::render_reasoning(step->thinking()).find("thinking") != std::string::npos);
+
+    engine::apply_event(state, ev("session.tool.failed",
+                                  {{"assistantMessageID", "msg_1"},
+                                   {"id", "call_2"},
+                                   {"error", {{"type", "tool.execution"}, {"message", "boom"}}}}));
+    const auto failed = step->tool("call_2");
+    check("failure recorded", failed != nullptr);
+    eq("failure status", failed->status, std::string("error"));
+    eq("failure message", failed->error, std::string("boom"));
+
+    engine::apply_event(state, ev("session.step.ended",
+                                  {{"assistantMessageID", "msg_1"},
+                                   {"finish", "stop"},
+                                   {"cost", 0.5},
+                                   {"tokens",
+                                    {{"input", 10},
+                                     {"output", 5},
+                                     {"reasoning", 0},
+                                     {"cache", {{"read", 0}, {"write", 0}}}}}}));
+    check("step finished", step->finished);
+    eq("cost recorded", state.cost, 0.5);
+
+    // A second step becomes its own Step.
+    engine::apply_event(state, ev("session.step.started", {{"assistantMessageID", "msg_2"}}));
+    engine::apply_event(state, ev("session.text.delta",
+                                  {{"assistantMessageID", "msg_2"}, {"ordinal", 0}, {"delta", "second"}}));
+    eq("two steps tracked", state.steps.size(), std::size_t{2});
+    eq("first step text intact", state.steps.front()->text(), std::string("Hello"));
+    eq("second step text", state.steps.back()->text(), std::string("second"));
+    eq("turn text joins steps", state.text(), std::string("Hello\n\nsecond"));
+
+    engine::apply_event(state, ev("session.execution.succeeded", Json::object()));
+    eq("outcome recorded", state.outcome.value_or(""), std::string("succeeded"));
+
+    // Failures.
+    engine::TurnState failing("ses_test");
+    engine::apply_event(failing, ev("session.step.started", {{"assistantMessageID", "msg_1"}}));
+    engine::apply_event(failing,
+                        ev("session.step.failed", {{"assistantMessageID", "msg_1"},
+                                                   {"error", {{"type", "aborted"}, {"message", "Step interrupted"}}}}));
+    engine::apply_event(failing, ev("session.execution.failed",
+                                    {{"error", {{"type", "aborted"}, {"message", "aborted by user"}}}}));
+    eq("outcome failed", failing.outcome.value_or(""), std::string("failed"));
+    eq("error message kept", failing.error.value_or(""), std::string("aborted by user"));
+    eq("step error kept", failing.steps.front()->error.value_or(""), std::string("Step interrupted"));
+
+    // The execution-level error falls back to the type field, unlike step errors.
+    engine::TurnState typed("ses_test");
+    engine::apply_event(typed, ev("session.execution.failed", {{"error", {{"type", "aborted"}}}}));
+    eq("error falls back to type", typed.error.value_or(""), std::string("aborted"));
+
+    engine::TurnState retry("ses_test");
+    engine::apply_event(retry, ev("session.step.started", {{"assistantMessageID", "msg_1"}}));
+    engine::apply_event(retry, ev("session.retry.scheduled", Json::object()));
+    check("retry surfaced", engine::render_status(retry).find("retry") != std::string::npos);
+
+    engine::TurnState perms("ses_test");
+    engine::apply_event(perms, ev("permission.asked", {{"id", "req_1"}}));
+    eq("permission pending", perms.pending_permissions(), std::size_t{1});
+    engine::apply_event(perms, ev("permission.replied", {{"requestID", "req_1"}}));
+    eq("permission cleared", perms.pending_permissions(), std::size_t{0});
+
+    // render_footer drops the zero-cost / zero-token placeholders.
+    engine::TurnState footer("ses_test");
+    engine::apply_event(footer, ev("session.step.started", {{"assistantMessageID", "m"}}));
+    const auto fstep = footer.steps.front();
+    const std::string bare = engine::render_footer(footer, *fstep, "m/x");
+    check("footer starts with the model", bare.rfind("m/x", 0) == 0);
+    check("footer drops the cost placeholder", bare.find("$0.00") == std::string::npos);
+    check("footer drops the token placeholder", bare.find("0 tokens") == std::string::npos);
+    fstep->cost = 1.5;
+    check("footer includes cost",
+          engine::render_footer(footer, *fstep, "m/x").find("$1.50") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
     test_text();
     test_sse();
     test_store();
+    test_turn();
 
     std::printf("\n%s\n", std::string(40, '=').c_str());
     if (failures != 0) {
