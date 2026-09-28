@@ -134,17 +134,12 @@ py::object cache_dir() {
 
 // Run a blocking native call with the GIL released, so Python drives the
 // transport from a worker thread without stalling the event loop.
+// Convert all Python arguments before entering this helper; the callback must
+// only touch native values.
 template <typename Fn>
 auto without_gil(Fn&& fn) {
     py::gil_scoped_release release;
     return fn();
-}
-
-std::optional<std::string> opt_str(const py::object& value) {
-    if (!value || value.is_none()) {
-        return std::nullopt;
-    }
-    return py::cast<std::string>(value);
 }
 
 py::list json_list(const std::vector<engine::Json>& values) {
@@ -592,11 +587,11 @@ class OpenCodeError(RuntimeError):
             py::arg("max_n") = 256, py::arg("timeout_ms") = 250)
         .def(
             "list_sessions",
-            [](engine::OpenCodeClient& self, long long limit, const py::object& cursor,
-               const py::object& directory, const py::object& search, std::string order) {
+            [](engine::OpenCodeClient& self, long long limit, const std::optional<std::string>& cursor,
+               const std::optional<std::string>& directory,
+               const std::optional<std::string>& search, std::string order) {
                 auto result = without_gil([&] {
-                    return self.list_sessions(limit, opt_str(cursor), opt_str(directory),
-                                              opt_str(search), order);
+                    return self.list_sessions(limit, cursor, directory, search, order);
                 });
                 return py::make_tuple(json_list(result.first), json_to_py(result.second));
             },
@@ -605,14 +600,13 @@ class OpenCodeError(RuntimeError):
             py::arg("order") = "desc")
         .def(
             "create_session",
-            [](engine::OpenCodeClient& self, const py::object& title, const py::object& agent,
-               const py::object& model, const py::object& directory) {
+            [](engine::OpenCodeClient& self, const std::optional<std::string>& title,
+               const std::optional<std::string>& agent,
+               const py::object& model, const std::optional<std::string>& directory) {
+                const auto native_model = model.is_none()
+                    ? std::nullopt : std::optional<engine::Json>(py_to_json(model));
                 auto result = without_gil([&] {
-                    return self.create_session(opt_str(title), opt_str(agent),
-                                               model.is_none() ? std::nullopt
-                                                               : std::optional<engine::Json>(
-                                                                     py_to_json(model)),
-                                               opt_str(directory));
+                    return self.create_session(title, agent, native_model, directory);
                 });
                 return json_to_py(result);
             },
@@ -628,8 +622,8 @@ class OpenCodeError(RuntimeError):
         .def(
             "update_session",
             [](engine::OpenCodeClient& self, const std::string& session_id,
-               const py::object& title) {
-                auto result = without_gil([&] { return self.update_session(session_id, opt_str(title)); });
+               const std::optional<std::string>& title) {
+                auto result = without_gil([&] { return self.update_session(session_id, title); });
                 return json_opt(result);
             },
             py::arg("session_id"), py::arg("title") = py::none())
@@ -642,8 +636,8 @@ class OpenCodeError(RuntimeError):
         .def(
             "fork_session",
             [](engine::OpenCodeClient& self, const std::string& session_id,
-               const py::object& before) {
-                auto result = without_gil([&] { return self.fork_session(session_id, opt_str(before)); });
+               const std::optional<std::string>& before) {
+                auto result = without_gil([&] { return self.fork_session(session_id, before); });
                 return json_to_py(result);
             },
             py::arg("session_id"), py::arg("before") = py::none())
@@ -651,9 +645,9 @@ class OpenCodeError(RuntimeError):
             "set_model",
             [](engine::OpenCodeClient& self, const std::string& session_id,
                const std::string& provider_id, const std::string& model_id,
-               const py::object& variant) {
+               const std::optional<std::string>& variant) {
                 without_gil([&] {
-                    self.set_model(session_id, provider_id, model_id, opt_str(variant));
+                    self.set_model(session_id, provider_id, model_id, variant);
                 });
             },
             py::arg("session_id"), py::arg("provider_id"), py::arg("model_id"),
@@ -668,13 +662,11 @@ class OpenCodeError(RuntimeError):
         .def(
             "prompt",
             [](engine::OpenCodeClient& self, const std::string& session_id, const std::string& text,
-               const py::object& files, const py::object& delivery) {
+               const py::object& files, const std::optional<std::string>& delivery) {
+                const auto native_files = files.is_none()
+                    ? std::nullopt : std::optional<engine::Json>(py_to_json(files));
                 auto result = without_gil([&] {
-                    return self.prompt(session_id, text,
-                                       files.is_none()
-                                           ? std::nullopt
-                                           : std::optional<engine::Json>(py_to_json(files)),
-                                       opt_str(delivery));
+                    return self.prompt(session_id, text, native_files, delivery);
                 });
                 return json_to_py(result);
             },
@@ -732,9 +724,9 @@ class OpenCodeError(RuntimeError):
             "reply_permission",
             [](engine::OpenCodeClient& self, const std::string& session_id,
                const std::string& request_id, const std::string& decision,
-               const py::object& message) {
+               const std::optional<std::string>& message) {
                 auto result = without_gil([&] {
-                    return self.reply_permission(session_id, request_id, decision, opt_str(message));
+                    return self.reply_permission(session_id, request_id, decision, message);
                 });
                 return json_opt(result);
             },

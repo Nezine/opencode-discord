@@ -23,6 +23,7 @@ run() {
 }
 
 run "$PY" -m tests.engine_smoke
+run "$PY" -m tests.client_bindings
 run "$PY" -m tests.parser_parity
 run "$PY" -m tests.units
 run "$PY" -m tests.discord_surface
