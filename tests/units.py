@@ -22,6 +22,7 @@ from bot.textutil import (  # noqa: E402
     sanitize_mentions,
     split_text,
 )
+from bot.oc import _Subscription  # noqa: E402
 from bot.turn import (  # noqa: E402
     TurnState,
     apply_event,
@@ -332,6 +333,19 @@ def test_sse_parser() -> None:
     eq("parser still usable", parser.feed(b'data: {"type":"after"}\n'), [{"type": "after"}])
 
 
+def test_subscription_filter() -> None:
+    print("\nsubscription filter")
+    sub = _Subscription(None, "ses_x")
+    # A form event nests the session id under data.form, unlike every other event.
+    sub.push({"type": "form.created", "data": {"form": {"id": "frm_1", "sessionID": "ses_x"}}})
+    sub.push({"type": "session.text.delta", "data": {"sessionID": "ses_x", "delta": "hi"}})
+    sub.push({"type": "session.text.delta", "data": {"sessionID": "ses_other", "delta": "no"}})
+    sub.push({"type": "form.created", "data": {"form": {"id": "frm_2", "sessionID": "ses_other"}}})
+    got = [sub._queue.get_nowait() for _ in range(2)]
+    kinds = sorted(e["type"] for e in got)
+    eq("only matching sessions pass", kinds, ["form.created", "session.text.delta"])
+
+
 def main() -> int:
     test_split_text()
     test_helpers()
@@ -340,6 +354,7 @@ def main() -> int:
     test_turn_failures()
     test_tool_detail()
     test_sse_parser()
+    test_subscription_filter()
     test_store()
     print("\n" + ("=" * 40))
     if failures:

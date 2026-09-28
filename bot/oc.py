@@ -247,8 +247,15 @@ class _Subscription:
     def push(self, event: Event) -> None:
         if self._closed:
             return
-        if self.session_id is not None and event.get("data", {}).get("sessionID") != self.session_id:
-            return
+        if self.session_id is not None:
+            data = event.get("data") or {}
+            session = data.get("sessionID")
+            if session is None:
+                # Form events nest the session id one level deeper than every
+                # other event, under data.form.sessionID.
+                session = (data.get("form") or {}).get("sessionID")
+            if session != self.session_id:
+                return
         try:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
