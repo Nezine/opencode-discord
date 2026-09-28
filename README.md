@@ -167,6 +167,9 @@ owned by systemd via `StateDirectory=`) and uploads in
 Discord message in place as the answer arrives (throttled to stay under
 rate limits). Each model step gets its own message, so a tool-using turn reads
 as a short sequence: `✅ read`, then the answer.
+The final answer replaces the streaming preview and is split into messages
+when needed, preserving the full text and keeping long code blocks balanced.
+Tool summaries appear once after each step's answer.
 
 **Effort.** OpenCode models expose *variants* — `low`, `medium`, `high`,
 `xhigh`, `max` depending on the model. `/effort` maps onto those, and switching

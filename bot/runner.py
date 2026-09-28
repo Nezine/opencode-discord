@@ -365,11 +365,14 @@ class Conversation:
         parts: list[str] = []
         if self.svc.cfg.show_reasoning and step.thinking:
             parts.append(render_reasoning(step.thinking))
-        parts.append(clip(step.text, 1700))
-        if self.svc.cfg.show_tools:
-            tools = render_tools(step)
-            if tools:
-                parts.append(tools)
+        tools = render_tools(step) if self.svc.cfg.show_tools else ""
+        # Reserve space for metadata and separators within Discord's limit.
+        overhead = sum(len(part) + 2 for part in parts)
+        if tools:
+            overhead += len(tools) + 2
+        parts.append(clip(step.text, min(1700, 1900 - overhead)))
+        if tools:
+            parts.append(tools)
         return "\n\n".join(parts)
 
     async def _flush_step(
@@ -389,8 +392,15 @@ class Conversation:
                 await live.delete()
             return
 
-        await live.finish(self._compose(state, step, model_label))
-        for extra in split_text(step.text, 1900)[1:]:
+        # The preview is deliberately clipped. Replace it with the first chunk
+        # of the complete reply so the continuation cannot skip any text.
+        parts: list[str] = []
+        if self.svc.cfg.show_reasoning and step.thinking:
+            parts.append(render_reasoning(step.thinking))
+        parts.append(step.text)
+        chunks = split_text("\n\n".join(parts), 1900)
+        await live.finish(chunks[0])
+        for extra in chunks[1:]:
             await messenger.send(extra)
         if tools:
             await messenger.send(tools)
@@ -489,4 +499,3 @@ class Conversation:
         if not self.state.session_id:
             await self.ensure_session()
         return await self.client.get_session(self.state.session_id)
-

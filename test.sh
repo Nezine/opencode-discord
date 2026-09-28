@@ -30,6 +30,7 @@ run "$PY" -m tests.discord_surface
 run "$PY" -m tests.view_callbacks
 run "$PY" -m tests.ensure_script
 run "$PY" -m tests.messenger
+run "$PY" -m tests.runner_output
 run "$PY" -m tests.commands_flow
 
 if [[ "${1:-}" == "--live" ]]; then
