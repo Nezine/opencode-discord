@@ -10,6 +10,7 @@ import sys
 import time
 from typing import Any
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -268,6 +269,38 @@ def acquire_lock() -> Any:
     return handle
 
 
+async def connect_with_retry(bot: DMBot, token: str) -> None:
+    """Log in to Discord, retrying transient connection/DNS failures.
+
+    ``network-online.target`` only guarantees an interface is up, not that the
+    resolver is answering, so a boot can race the bot and fail the first login
+    with ``Temporary failure in name resolution``. Let that settle instead of
+    letting the process exit and relying on a systemd restart.
+    """
+    deadline = time.monotonic() + 60.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await bot.start(token)
+            return
+        except discord.LoginFailure:
+            raise
+        except (aiohttp.ClientConnectorError, discord.HTTPException) as exc:
+            cause = getattr(exc, "__cause__", None)
+            retryable = isinstance(exc, aiohttp.ClientConnectorError) or isinstance(
+                cause, aiohttp.ClientConnectorError
+            )
+            if retryable and time.monotonic() < deadline:
+                delay = min(2.0 * attempt, 10.0)
+                log.warning(
+                    "could not reach Discord (%s); retrying in %.0fs", exc, delay
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+
+
 async def main() -> int:
     lock = acquire_lock()
     if lock is None:
@@ -305,7 +338,7 @@ async def main() -> int:
     bot = DMBot(cfg, service)
     async with bot:
         try:
-            await bot.start(cfg.discord_token)
+            await connect_with_retry(bot, cfg.discord_token)
         except discord.LoginFailure:
             log.error("Discord rejected DISCORD_TOKEN. Check the value in .env.")
             return 1
