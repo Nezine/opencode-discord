@@ -43,6 +43,7 @@ case "$1 $2" in
     exit 1
     ;;
   "service start")
+    touch "$STATE/start_attempted"
     [ -f "$STATE/start_fails" ] && { echo "boom" >&2; exit 1; }
     sleep "$STUB_START_DELAY"
     touch "$STATE/running"
@@ -53,7 +54,8 @@ exit 2
 """
 
 
-def run(tmp: Path, *, running: bool, start_fails: bool = False, delay: str = "0") -> tuple[int, str]:
+def run(tmp: Path, *, running: bool, start_fails: bool = False, delay: str = "0",
+        wait_only: bool = False) -> tuple[int, str]:
     state = tmp / "state"
     state.mkdir(exist_ok=True)
     if running:
@@ -70,7 +72,8 @@ def run(tmp: Path, *, running: bool, start_fails: bool = False, delay: str = "0"
         "STUB_START_DELAY": delay,
     }
     proc = subprocess.run(
-        ["bash", str(SCRIPT)], capture_output=True, text=True, env=env, timeout=120
+        ["bash", str(SCRIPT), *(["--wait-only"] if wait_only else [])],
+        capture_output=True, text=True, env=env, timeout=120
     )
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -81,6 +84,18 @@ def main() -> int:
         return 1
 
     print("\nensure-opencode.sh")
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        code, out = run(tmp, running=True, wait_only=True)
+        check("wait-only accepts a ready server", code == 0, out)
+        check("wait-only never starts a ready server", not (tmp / "state/start_attempted").exists())
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        code, out = run(tmp, running=False, wait_only=True)
+        check("wait-only fails when the server is unavailable", code != 0, out)
+        check("wait-only never spawns a daemon", not (tmp / "state/start_attempted").exists())
+
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         code, out = run(tmp, running=True)
@@ -99,6 +114,7 @@ def main() -> int:
         code, out = run(tmp, running=False, start_fails=True)
         check("still exits 0 when start fails", code == 0, f"code={code}")
         check("notes the failed start", "failed or timed out" in out, out)
+        check("preserves the startup error for diagnosis", "boom" in out, out)
         check("warns instead of hanging", "not up" in out, out)
 
     # A hung `opencode` must not wedge the unit: the script bounds every call.

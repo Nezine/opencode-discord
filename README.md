@@ -103,7 +103,7 @@ short explanation instead of reaching the model. Plain typing works immediately.
 
 ```sh
 mkdir -p ~/.config/systemd/user
-cp opencode-discord.service ~/.config/systemd/user/
+cp opencode-server.service opencode-discord.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now opencode-discord
 loginctl enable-linger "$USER"     # start at boot without logging in
@@ -118,7 +118,9 @@ What "always on" actually means here:
 | --- | --- |
 | Starts at boot, no login needed | `loginctl enable-linger` |
 | Recovers from a crash | `Restart=always`, every 10s |
-| Recovers if OpenCode isn't up yet | `ExecStartPre=ensure-opencode.sh` starts it |
+| Starts OpenCode at boot | `Wants=opencode-server.service` starts a separate server unit |
+| Waits for OpenCode to be ready | `ensure-opencode.sh --wait-only` checks it before starting the bot |
+| Recovers from an OpenCode crash | The server unit restarts after 5s |
 | Never gives up | `StartLimitIntervalSec=0` — no start-rate limit |
 | Clean shutdown mid-reply | `KillSignal=SIGINT`, 20s grace |
 | Refuses to run twice | `flock` on `bot.lock`, so you never get duplicate replies |
@@ -136,6 +138,18 @@ again, but the conversation does not come back.
 State lives in `~/.local/state/opencode-discord/` (XDG state dir, created and
 owned by systemd via `StateDirectory=`) and uploads in
 `~/.cache/opencode-discord/`.
+
+The local OpenCode server runs in `opencode-server.service`, outside the bot's
+read-only filesystem sandbox. It can write its registry under
+`~/.local/state/opencode/` and work on user projects. Restarting the bot leaves
+the server and its conversations running. Do not launch a background server
+from `ExecStartPre`: systemd kills processes left by that step before starting
+the bot.
+
+When upgrading an existing installation, copy **both** unit files above, run
+`systemctl --user daemon-reload`, then `systemctl --user restart opencode-discord`.
+If an OpenCode server is already running outside systemd, migrate it during an
+idle period so that only one process owns the background service.
 
 ## Commands
 

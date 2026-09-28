@@ -3,6 +3,9 @@
 The bot is one process with two halves:
 
 ```
+opencode-server.service                     separate user service
+  └─ opencode serve --service               API + agent tool execution
+
 opencode-discord.service
   └─ .venv/bin/python -m bot.main            (cwd = the repo root)
        ├─ bot/                                Discord + asyncio        [Python]
@@ -11,6 +14,11 @@ opencode-discord.service
             │    → SseParser → ordered_json → bounded queue + condvar
             └─ blocking HTTP calls, GIL released
 ```
+
+The bridge waits for the server with `ensure-opencode.sh --wait-only`. The
+server has its own systemd cgroup and can write the OpenCode state registry
+and user projects; the bridge keeps its read-only filesystem sandbox.
+Restarting the bridge does not stop the server.
 
 ## Where the line falls
 

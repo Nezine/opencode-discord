@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenCode background server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# --service registers the endpoint for `opencode service status` and the CLI.
+ExecStart=/usr/bin/env opencode serve --service --hostname 127.0.0.1
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+# OpenCode executes tools in user projects and must run outside the bridge's
+# read-only filesystem sandbox. Keep it in its own cgroup across bot restarts.
+
+[Install]
+WantedBy=default.target
