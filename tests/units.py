@@ -180,6 +180,41 @@ def test_turn_state() -> None:
     eq("outcome recorded", state.outcome, "succeeded")
 
 
+def test_forms() -> None:
+    print("\nforms")
+    state = TurnState(session_id="ses_test")
+    eq("no forms yet", state.pending_forms, 0)
+    apply_event(
+        state,
+        {
+            "type": "form.created",
+            "data": {
+                "form": {
+                    "id": "frm_1",
+                    "sessionID": "ses_test",
+                    "title": "Pick one",
+                    "fields": [
+                        {
+                            "key": "choice",
+                            "type": "string",
+                            "title": "Choice",
+                            "options": [
+                                {"value": "a", "label": "A"},
+                                {"value": "b", "label": "B"},
+                            ],
+                        }
+                    ],
+                }
+            },
+        },
+    )
+    eq("form pending", state.pending_forms, 1)
+    check("form surfaced as raw json", state.form("frm_1") is not None)
+    check("forms list exposes it", len(state.forms) == 1)
+    apply_event(state, {"type": "form.replied", "data": {"id": "frm_1"}})
+    eq("form cleared on reply", state.pending_forms, 0)
+
+
 def test_turn_failures() -> None:
     print("\nturn failures")
     state = TurnState(session_id="ses_test")
@@ -301,6 +336,7 @@ def main() -> int:
     test_split_text()
     test_helpers()
     test_turn_state()
+    test_forms()
     test_turn_failures()
     test_tool_detail()
     test_sse_parser()

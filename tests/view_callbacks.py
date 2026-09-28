@@ -25,6 +25,7 @@ from bot.service import Service  # noqa: E402
 from bot.store import Store  # noqa: E402
 from bot.ui import (  # noqa: E402
     PER_PAGE,
+    FormView,
     PermissionView,
     SessionSelectView,
     SelectOnlyView,
@@ -183,6 +184,28 @@ def main() -> int:
     )
     assert_live(only, "select")
     check("select has two options", len(only.children[0].options) == 2)
+
+    print("\nFormView")
+    form = FormView(
+        svc,
+        "ses_abc",
+        {
+            "id": "frm_1",
+            "sessionID": "ses_abc",
+            "title": "Pick one",
+            "fields": [
+                {
+                    "key": "choice",
+                    "type": "string",
+                    "title": "Choice",
+                    "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}],
+                },
+                {"key": "ok", "type": "boolean", "title": "Confirm"},
+            ],
+        },
+    )
+    assert_live(form, "form")
+    check("form has a select and boolean buttons", len(form.children) == 3, str(len(form.children)))
 
     print("\nselect callback is a coroutine")
     for view, label in ((first, "session select"), (permission, "permission"), (only, "select-only")):

@@ -72,6 +72,40 @@ public:
     std::shared_ptr<ToolActivity> tool_or_create(const std::string& call_id);
 };
 
+// One option a form field offers the user.
+struct FormOption {
+    std::string value;
+    std::string label;
+    std::string description;
+};
+
+// One field in a form. Only the shapes the Discord surface can answer are
+// modelled: option lists (single and multi select) and booleans. Text/number
+// entry and external fields are carried as raw JSON so the bot can still show
+// them, but they are not interactive.
+struct FormField {
+    std::string key;
+    std::string type;
+    std::string title;
+    std::string description;
+    bool required = false;
+    std::vector<FormOption> options;
+    Json raw = Json::object();
+
+    bool has_options() const { return !options.empty(); }
+};
+
+// A pending "choose an option" prompt from OpenCode. Mirrors Form.Info.
+struct Form {
+    std::string id;
+    std::string session_id;
+    std::string title;
+    std::vector<FormField> fields;
+    Json raw = Json::object();
+
+    const FormField* field(const std::string& key) const;
+};
+
 class TurnState {
 public:
     explicit TurnState(std::string session_id);
@@ -88,12 +122,18 @@ public:
     // Answered/unanswered permission requests, keyed by request id, in arrival
     // order. Only the count is consumed by the bot.
     std::vector<std::pair<std::string, Json>> permissions;
+    // Active "choose an option" forms, keyed by form id, in arrival order.
+    std::vector<std::pair<std::string, Form>> forms;
 
     double duration() const;
     std::string text() const;
 
     // Permission requests that have not been answered yet.
     std::size_t pending_permissions() const { return permissions.size(); }
+
+    // Forms that have not been answered or cancelled yet.
+    std::size_t pending_forms() const { return forms.size(); }
+    const Form* form(const std::string& id) const;
 
     std::shared_ptr<Step> step_for(const std::string& message_id) const;
     std::map<std::string, std::string> tool_names() const;

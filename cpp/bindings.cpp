@@ -418,6 +418,23 @@ PYBIND11_MODULE(_engine, m) {
                                    }
                                    return out;
                                })
+        .def_property_readonly("pending_forms", &engine::TurnState::pending_forms)
+        .def_property_readonly(
+            "forms",
+            [](const engine::TurnState& self) {
+                py::list out;
+                for (const auto& [key, form] : self.forms) {
+                    out.append(json_to_py(form.raw));
+                }
+                return out;
+            })
+        .def(
+            "form",
+            [](const engine::TurnState& self, const std::string& id) -> py::object {
+                const engine::Form* form = self.form(id);
+                return form != nullptr ? json_to_py(form->raw) : py::none();
+            },
+            py::arg("id"))
         .def("step_for", &engine::TurnState::step_for, py::arg("message_id"))
         .def("tool_names", &engine::TurnState::tool_names);
 
@@ -732,6 +749,36 @@ class OpenCodeError(RuntimeError):
             },
             py::arg("session_id"), py::arg("request_id"), py::arg("decision"),
             py::arg("message") = py::none())
+        .def(
+            "forms",
+            [](engine::OpenCodeClient& self, const std::string& session_id) {
+                auto result = without_gil([&] { return self.forms(session_id); });
+                return json_list(result);
+            },
+            py::arg("session_id"))
+        .def(
+            "get_form",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& form_id) {
+                auto result = without_gil([&] { return self.get_form(session_id, form_id); });
+                return json_to_py(result);
+            },
+            py::arg("session_id"), py::arg("form_id"))
+        .def(
+            "reply_form",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& form_id, const py::object& answer) {
+                const engine::Json native = py_to_json(answer);
+                without_gil([&] { self.reply_form(session_id, form_id, native); });
+            },
+            py::arg("session_id"), py::arg("form_id"), py::arg("answer"))
+        .def(
+            "cancel_form",
+            [](engine::OpenCodeClient& self, const std::string& session_id,
+               const std::string& form_id) {
+                without_gil([&] { self.cancel_form(session_id, form_id); });
+            },
+            py::arg("session_id"), py::arg("form_id"))
         .def(
             "models",
             [](engine::OpenCodeClient& self) {

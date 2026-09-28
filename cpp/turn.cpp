@@ -244,6 +244,63 @@ bool is_known_status(const std::string& status) {
     return status == "completed" || status == "error" || status == "running";
 }
 
+FormOption parse_option(const Json& value) {
+    FormOption option;
+    if (!value.is_object()) {
+        return option;
+    }
+    option.value = string_or_empty(lookup(value, "value"));
+    option.label = string_or_empty(lookup(value, "label"));
+    option.description = string_or_empty(lookup(value, "description"));
+    return option;
+}
+
+FormField parse_field(const Json& value) {
+    FormField field;
+    field.raw = value;
+    if (!value.is_object()) {
+        return field;
+    }
+    field.key = string_or_empty(lookup(value, "key"));
+    field.type = string_or_empty(lookup(value, "type"));
+    field.title = string_or_empty(lookup(value, "title"));
+    field.description = string_or_empty(lookup(value, "description"));
+    if (const auto* required = lookup(value, "required"); required != nullptr && required->is_boolean()) {
+        field.required = required->get<bool>();
+    }
+    if (const auto* options = lookup(value, "options"); options != nullptr && options->is_array()) {
+        for (const auto& option : *options) {
+            FormOption parsed = parse_option(option);
+            if (!parsed.value.empty() || !parsed.label.empty()) {
+                field.options.push_back(std::move(parsed));
+            }
+        }
+    }
+    // A boolean field is a fixed Yes/No pair with no explicit options.
+    if (field.type == "boolean" && field.options.empty()) {
+        field.options.push_back({"true", "Yes", ""});
+        field.options.push_back({"false", "No", ""});
+    }
+    return field;
+}
+
+Form parse_form(const Json& value) {
+    Form form;
+    form.raw = value;
+    if (!value.is_object()) {
+        return form;
+    }
+    form.id = string_or_empty(lookup(value, "id"));
+    form.session_id = string_or_empty(lookup(value, "sessionID"));
+    form.title = string_or_empty(lookup(value, "title"));
+    if (const auto* fields = lookup(value, "fields"); fields != nullptr && fields->is_array()) {
+        for (const auto& field : *fields) {
+            form.fields.push_back(parse_field(field));
+        }
+    }
+    return form;
+}
+
 }  // namespace
 
 long long token_total(const Json& tokens) {
@@ -446,6 +503,24 @@ std::map<std::string, std::string> TurnState::tool_names() const {
     return names;
 }
 
+const FormField* Form::field(const std::string& key) const {
+    for (const auto& field : fields) {
+        if (field.key == key) {
+            return &field;
+        }
+    }
+    return nullptr;
+}
+
+const Form* TurnState::form(const std::string& id) const {
+    for (const auto& [key, value] : forms) {
+        if (key == id) {
+            return &value;
+        }
+    }
+    return nullptr;
+}
+
 void apply_event(TurnState& state, const Json& event) {
     const std::string kind = string_or_empty(lookup(event, "type"));
     const Json data = object_or_empty(lookup(event, "data"));
@@ -538,6 +613,32 @@ void apply_event(TurnState& state, const Json& event) {
         for (auto it = state.permissions.begin(); it != state.permissions.end(); ++it) {
             if (it->first == key) {
                 state.permissions.erase(it);
+                break;
+            }
+        }
+    } else if (kind == "form.created") {
+        // The event nests the whole form under `data.form`.
+        const Json form_json = object_or_empty(lookup(data, "form"));
+        Form form = parse_form(form_json);
+        if (form.id.empty()) {
+            return;
+        }
+        bool replaced = false;
+        for (auto& [existing, payload] : state.forms) {
+            if (existing == form.id) {
+                payload = form;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            state.forms.emplace_back(form.id, std::move(form));
+        }
+    } else if (kind == "form.replied" || kind == "form.cancelled") {
+        const std::string key = string_or_empty(lookup(data, "id"));
+        for (auto it = state.forms.begin(); it != state.forms.end(); ++it) {
+            if (it->first == key) {
+                state.forms.erase(it);
                 break;
             }
         }

@@ -296,6 +296,161 @@ class PermissionView(discord.ui.View):
         return self.svc.cfg.allowed(interaction.user.id)
 
 
+def _field_options(field: dict) -> list[discord.SelectOption]:
+    """Discord options for a form field's choices, capped to the API limit."""
+    options: list[discord.SelectOption] = []
+    for option in field.get("options") or []:
+        label = _clip_option(option.get("label") or option.get("value") or "", 100)
+        if not label:
+            continue
+        options.append(
+            discord.SelectOption(
+                label=label,
+                description=_clip_option(option.get("description") or "", 100) or None,
+                value=option.get("value") or label,
+            )
+        )
+    return options[:MAX_OPTIONS]
+
+
+class FormView(discord.ui.View):
+    """Let the user answer a form: one select (or Yes/No buttons) per field.
+
+    Fields without a fixed set of choices (free text, numbers) are shown in the
+    embed but not rendered as controls; the turn waits until the server settles
+    the form some other way.
+    """
+
+    def __init__(self, service: "Service", session_id: str, form: dict, timeout: float = 1800.0) -> None:
+        super().__init__(timeout=timeout)
+        self.svc = service
+        self.session_id = session_id
+        self.form_id = form.get("id", "")
+        self.title = form.get("title") or "Answer needed"
+        self.fields = form.get("fields") or []
+        self._done = False
+        self._answers: dict[str, Any] = {}
+        self._render()
+
+    @property
+    def answerable(self) -> list[dict]:
+        # Booleans are always answerable (Yes/No); other fields need an options
+        # list to be rendered as a control.
+        return [f for f in self.fields if f.get("options") or f.get("type") == "boolean"]
+
+    def _render(self) -> None:
+        self.clear_items()
+        # Discord rules: a select must sit alone in its row, buttons may share.
+        # Select fields therefore get one row each, then the boolean fields share
+        # a single button row (capped at five Yes/No pairs worth of buttons).
+        row = 0
+        boolean_fields = [f for f in self.answerable if f.get("type") == "boolean"]
+        for field in self.answerable:
+            if field.get("type") == "boolean":
+                continue
+            if row > 4:
+                break
+            self._add_select(field, row)
+            row += 1
+        if boolean_fields and row <= 4:
+            self._add_boolean_buttons(boolean_fields, row)
+
+    def _add_boolean_buttons(self, fields: list[dict], row: int) -> None:
+        def make_callback(field: dict, value: str):
+            async def callback(interaction: discord.Interaction) -> None:
+                self._answers[field["key"]] = value == "true"
+                await self._maybe_reply(interaction)
+
+            return callback
+
+        # Discord caps a row at five buttons; a boolean form rarely exceeds that.
+        for field in fields[:2]:
+            yes = discord.ui.Button(
+                label=f"{field.get('title') or field.get('key') or 'Yes'} · Yes",
+                style=discord.ButtonStyle.primary,
+                row=row,
+            )
+            yes.callback = make_callback(field, "true")
+            self.add_item(yes)
+            no = discord.ui.Button(
+                label="No",
+                style=discord.ButtonStyle.secondary,
+                row=row,
+            )
+            no.callback = make_callback(field, "false")
+            self.add_item(no)
+
+    def _add_select(self, field: dict, row: int) -> None:
+        options = _field_options(field)
+        if not options:
+            return
+        is_multi = field.get("type") == "multiselect"
+        select = discord.ui.Select(
+            placeholder=(field.get("title") or field.get("key"))[:150],
+            custom_id=f"form:{self.form_id}:{field['key']}",
+            options=options,
+            min_values=1,
+            max_values=len(options) if is_multi else 1,
+            row=row,
+        )
+
+        async def on_pick(interaction: discord.Interaction) -> None:
+            values = [str(v) for v in interaction.data.get("values", [])]
+            self._answers[field["key"]] = values if is_multi else values[0]
+            await self._maybe_reply(interaction)
+
+        select.callback = on_pick
+        self.add_item(select)
+
+    async def _maybe_reply(self, interaction: discord.Interaction) -> None:
+        # A single-choice form replies immediately; a multi-field form only
+        # submits once every answerable field has been picked.
+        missing = [f["key"] for f in self.answerable if f["key"] not in self._answers]
+        if len(self.answerable) > 1 and missing:
+            await interaction.response.defer()
+            return
+        await self._submit(interaction)
+
+    async def _submit(self, interaction: discord.Interaction) -> None:
+        if self._done:
+            await interaction.response.defer()
+            return
+        self._done = True
+        from .oc import OpenCodeError
+
+        try:
+            await self.svc.client.reply_form(self.session_id, self.form_id, self._answers)
+        except OpenCodeError as exc:
+            self._done = False
+            await interaction.response.send_message(f"❌ `{exc.message}`", ephemeral=True)
+            return
+        await interaction.response.edit_message(content=f"✅ Answered **{self.title}**.", view=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return self.svc.cfg.allowed(interaction.user.id)
+
+
+def form_embed(form: dict) -> discord.Embed:
+    title = form.get("title") or "Answer needed"
+    embed = discord.Embed(
+        title=f"🔎 {title}",
+        description="Pick an option below to answer.",
+        color=discord.Colour.blurple(),
+    )
+    for field in form.get("fields") or []:
+        name = field.get("title") or field.get("key") or "field"
+        if field.get("description"):
+            name += f" — {field.get('description')}"
+        if field.get("options"):
+            value = "\n".join(
+                f"• `{(o.get('value') or o.get('label') or '')[:60]}`" for o in field.get("options")[:8]
+            )
+        else:
+            value = "_free-text field — not answerable from Discord_"
+        embed.add_field(name=name[:256], value=value or "_no options_", inline=False)
+    return embed
+
+
 def permission_embed(data: dict) -> discord.Embed:
     action = data.get("action") or "action"
     resources = data.get("resources") or []

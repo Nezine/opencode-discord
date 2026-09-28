@@ -268,6 +268,7 @@ class Conversation:
             last_hydrate = 0.0
             flushed: set[str] = set()
             perm_notified: set[str] = set()
+            form_notified: set[str] = set()
 
             while True:
                 timeout = max(1.0, min(15.0, deadline - time.monotonic()))
@@ -320,6 +321,14 @@ class Conversation:
                         await self.svc.show_permission_request(
                             self, event.get("data") or {}, messenger
                         )
+                    continue
+
+                if kind == "form.created":
+                    form = (event.get("data") or {}).get("form") or {}
+                    fid = form.get("id", "")
+                    if fid and fid not in form_notified:
+                        form_notified.add(fid)
+                        await self.svc.show_form(self, form, messenger)
                     continue
 
                 step = state.current
@@ -433,6 +442,12 @@ class Conversation:
             await messenger.send(
                 f"⏳ {pending} permission request{'s' if pending != 1 else ''} still unanswered — "
                 "use the buttons above to let the turn continue."
+            )
+        if state.pending_forms:
+            pending = state.pending_forms
+            await messenger.send(
+                f"⏳ {pending} question{'s' if pending != 1 else ''} still unanswered — "
+                "pick an option above to let the turn continue."
             )
         await messenger.send(f"-#{self._turn_summary(state, model_label)}")
 

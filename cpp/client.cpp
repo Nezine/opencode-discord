@@ -357,6 +357,29 @@ std::optional<Json> OpenCodeClient::reply_permission(const std::string& session_
     return optional_data(result);
 }
 
+// ---------------------------------------------------------------------- forms
+
+std::vector<Json> OpenCodeClient::forms(const std::string& session_id) {
+    return list_from_data(
+        request("GET", "/api/session/" + session_id + "/form", {}, std::nullopt));
+}
+
+Json OpenCodeClient::get_form(const std::string& session_id, const std::string& form_id) {
+    return require_data(
+        request("GET", "/api/session/" + session_id + "/form/" + form_id, {}, std::nullopt));
+}
+
+void OpenCodeClient::reply_form(const std::string& session_id, const std::string& form_id,
+                                const Json& answer) {
+    Json body = Json::object();
+    body["answer"] = answer;
+    request("POST", "/api/session/" + session_id + "/form/" + form_id + "/reply", {}, body);
+}
+
+void OpenCodeClient::cancel_form(const std::string& session_id, const std::string& form_id) {
+    request("DELETE", "/api/session/" + session_id + "/form/" + form_id, {}, std::nullopt);
+}
+
 // ------------------------------------------------------------ config lookups
 
 std::vector<Json> OpenCodeClient::models() {

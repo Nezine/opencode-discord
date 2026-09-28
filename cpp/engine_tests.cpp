@@ -355,6 +355,48 @@ void test_turn() {
     engine::apply_event(perms, ev("permission.replied", {{"requestID", "req_1"}}));
     eq("permission cleared", perms.pending_permissions(), std::size_t{0});
 
+    // Forms: a "choose an option" prompt arrives as form.created with the whole
+    // form nested under data.form, and settles via form.replied/form.cancelled.
+    Json form_data = Json::object();
+    form_data["id"] = "frm_1";
+    form_data["sessionID"] = "ses_test";
+    form_data["title"] = "Pick one";
+    form_data["fields"] = Json::array({
+        Json{{"key", "choice"},
+             {"type", "string"},
+             {"title", "Choice"},
+             {"options", Json::array({Json{{"value", "a"}, {"label", "A"}},
+                                      Json{{"value", "b"}, {"label", "B"}}})}},
+    });
+    engine::TurnState forms("ses_test");
+    engine::apply_event(forms, ev("form.created", Json{{"form", form_data}}));
+    eq("form pending", forms.pending_forms(), std::size_t{1});
+    const engine::Form* form = forms.form("frm_1");
+    check("form looked up", form != nullptr);
+    eq("form title", form->title, std::string("Pick one"));
+    eq("form field count", form->fields.size(), std::size_t{1});
+    eq("form option count", form->fields.front().options.size(), std::size_t{2});
+    eq("form option label", form->fields.front().options.front().label, std::string("A"));
+    engine::apply_event(forms, ev("form.replied", {{"id", "frm_1"}}));
+    eq("form cleared on reply", forms.pending_forms(), std::size_t{0});
+
+    engine::TurnState forms_cancelled("ses_test");
+    engine::apply_event(forms_cancelled, ev("form.created", {{"form", {{"id", "frm_2"}}}}));
+    eq("form pending before cancel", forms_cancelled.pending_forms(), std::size_t{1});
+    engine::apply_event(forms_cancelled, ev("form.cancelled", {{"id", "frm_2"}}));
+    eq("form cleared on cancel", forms_cancelled.pending_forms(), std::size_t{0});
+
+    // Boolean fields gain a fixed Yes/No pair without explicit options.
+    Json bool_field = Json{{"key", "ok"}, {"type", "boolean"}};
+    engine::TurnState boolean_form("ses_test");
+    engine::apply_event(boolean_form,
+                        ev("form.created",
+                           Json{{"form", Json{{"id", "frm_bool"},
+                                              {"fields", Json::array({bool_field})}}}}));
+    const engine::Form* bform = boolean_form.form("frm_bool");
+    check("boolean form looked up", bform != nullptr);
+    eq("boolean options synthesised", bform->fields.front().options.size(), std::size_t{2});
+
     // render_footer drops the zero-cost / zero-token placeholders.
     engine::TurnState footer("ses_test");
     engine::apply_event(footer, ev("session.step.started", {{"assistantMessageID", "m"}}));

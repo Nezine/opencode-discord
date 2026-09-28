@@ -179,6 +179,18 @@ class OpenCodeClient:
     ) -> dict | None:
         return await self._call("reply_permission", session_id, request_id, decision, message)
 
+    async def forms(self, session_id: str) -> list[dict]:
+        return await self._call("forms", session_id)
+
+    async def get_form(self, session_id: str, form_id: str) -> dict:
+        return await self._call("get_form", session_id, form_id)
+
+    async def reply_form(self, session_id: str, form_id: str, answer: dict) -> None:
+        await self._call("reply_form", session_id, form_id, answer)
+
+    async def cancel_form(self, session_id: str, form_id: str) -> None:
+        await self._call("cancel_form", session_id, form_id)
+
     # ---------------------------------------------------------- config lookups
 
     async def models(self) -> list[dict]:

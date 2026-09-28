@@ -99,6 +99,11 @@ public:
                                          const std::string& request_id,
                                          const std::string& decision,
                                          const std::optional<std::string>& message);
+    std::vector<Json> forms(const std::string& session_id);
+    Json get_form(const std::string& session_id, const std::string& form_id);
+    void reply_form(const std::string& session_id, const std::string& form_id,
+                    const Json& answer);
+    void cancel_form(const std::string& session_id, const std::string& form_id);
     std::vector<Json> models();
     std::vector<Json> agents();
     std::vector<std::pair<std::string, std::string>> active_sessions();

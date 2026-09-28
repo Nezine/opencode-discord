@@ -15,7 +15,7 @@ from .oc import OpenCodeClient, OpenCodeError
 from .runner import BusyError, Conversation
 from .store import Store
 from .textutil import clip
-from .ui import PermissionView, SessionSelectView, permission_embed
+from .ui import FormView, PermissionView, SessionSelectView, form_embed, permission_embed
 
 log = logging.getLogger("service")
 
@@ -246,6 +246,14 @@ class Service:
             return
         view = PermissionView(self, data.get("sessionID", ""), data.get("id", ""))
         await messenger.send(embed=permission_embed(data), view=view)
+
+    async def show_form(self, conversation: Conversation, form: dict, messenger: Messenger) -> None:
+        """Surface a pending "choose an option" form so the user can answer it."""
+        if not self.cfg.allowed(conversation.user_id):
+            return
+        session_id = form.get("sessionID") or conversation.session_id or ""
+        view = FormView(self, session_id, form)
+        await messenger.send(embed=form_embed(form), view=view)
 
     # ------------------------------------------------------------ attachments
 
