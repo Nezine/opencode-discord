@@ -196,6 +196,11 @@ into the live turn (`delivery: "steer"`) instead of queueing. `/stop` cancels.
 path outside the project), the bot posts the request with *Allow once* /
 *Always allow* / *Deny* buttons and the turn pauses until you answer.
 
+**Questions.** When the agent needs you to choose between options (its
+`question` tool), the bot renders the choices as a Discord select menu or
+Yes/No buttons and the turn pauses until you pick one. Multi-field forms submit
+once every field is answered.
+
 **Files.** Attachments are written to `ATTACHMENT_DIR` and passed to the model as
 file URIs, so images work with multimodal models.
 
