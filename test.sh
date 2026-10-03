@@ -28,6 +28,7 @@ run "$PY" -m tests.parser_parity
 run "$PY" -m tests.units
 run "$PY" -m tests.discord_surface
 run "$PY" -m tests.view_callbacks
+run "$PY" -m tests.form_inputs
 run "$PY" -m tests.ensure_script
 run "$PY" -m tests.messenger
 run "$PY" -m tests.runner_output

@@ -198,8 +198,12 @@ path outside the project), the bot posts the request with *Allow once* /
 
 **Questions.** When the agent needs you to choose between options (its
 `question` tool), the bot renders the choices as a Discord select menu or
-Yes/No buttons and the turn pauses until you pick one. Multi-field forms submit
-once every field is answered.
+Yes/No buttons. Text and numeric questions have an **Enter** button that opens
+an input window; numbers are checked and converted by the C++ engine before
+submission. Forms with more than four fields have Previous/Next buttons.
+Multi-field forms submit once every field is answered, and keep your answers
+if the server request fails so you can retry. Input windows accept up to 4,000
+characters per answer. Unsupported field types must be answered in OpenCode.
 
 **Files.** Attachments are written to `ATTACHMENT_DIR` and passed to the model as
 file URIs, so images work with multimodal models.

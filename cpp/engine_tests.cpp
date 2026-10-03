@@ -16,6 +16,7 @@
 
 #include "client.hpp"
 #include "config.hpp"
+#include "forms.hpp"
 #include "sse.hpp"
 #include "store.hpp"
 #include "text.hpp"
@@ -545,6 +546,18 @@ void test_client() {
 }  // namespace
 
 int main() {
+    check("form preserves text", engine::parse_form_input(Json{{"type", "string"}}, "  hello\n") == Json("  hello\n"));
+    check("form parses integer", engine::parse_form_input(Json{{"type", "integer"}}, "42") == Json(42));
+    check("form parses decimal", engine::parse_form_input(Json{{"type", "number"}}, "-2.5") == Json(-2.5));
+    for (const auto& invalid : {"nan", "inf", "1e9999", "12abc", ""}) {
+        bool rejected = false;
+        try {
+            engine::parse_form_input(Json{{"type", "number"}}, invalid);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        check("invalid form number rejected: " + std::string(invalid), rejected);
+    }
     test_text();
     test_sse();
     test_store();

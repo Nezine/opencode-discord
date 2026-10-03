@@ -22,6 +22,11 @@ Restarting the bridge does not stop the server.
 
 ## Where the line falls
 
+Free-text form answers are collected by Discord modals in `bot/ui.py`.
+`cpp/forms.cpp` validates required values and converts numeric answers before
+the existing native client sends them to OpenCode. Python handles the view
+pages and interaction acknowledgements.
+
 The split is not "make it faster" (it was not slow). It is that the two halves
 have genuinely different natures, and each language gets the half it is good at:
 

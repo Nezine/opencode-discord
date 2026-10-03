@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import discord
 
+from ._engine import parse_form_input
 from .textutil import rel_time
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -313,13 +314,42 @@ def _field_options(field: dict) -> list[discord.SelectOption]:
     return options[:MAX_OPTIONS]
 
 
-class FormView(discord.ui.View):
-    """Let the user answer a form: one select (or Yes/No buttons) per field.
+class FormInputModal(discord.ui.Modal):
+    """Collect text in Discord; the native engine validates and converts it."""
 
-    Fields without a fixed set of choices (free text, numbers) are shown in the
-    embed but not rendered as controls; the turn waits until the server settles
-    the form some other way.
-    """
+    def __init__(self, view: "FormView", field: dict) -> None:
+        super().__init__(title=_clip_option(view.title, 45), timeout=900)
+        self.form_view = view
+        self.field = field
+        current = view._answers.get(field["key"])
+        self.answer = discord.ui.TextInput(
+            label=_clip_option(field.get("title") or field["key"], 45),
+            style=(discord.TextStyle.short if field.get("type") in {"number", "integer"}
+                   else discord.TextStyle.paragraph),
+            required=field.get("required", True),
+            max_length=4000,
+            default=str(current) if current is not None else None,
+        )
+        self.add_item(self.answer)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.form_view.interaction_check(interaction)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.form_view._done or self.form_view.is_finished():
+            await interaction.response.send_message("This form is closed or already answered.", ephemeral=True)
+            return
+        try:
+            value = parse_form_input(self.field, self.answer.value)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        self.form_view._answers[self.field["key"]] = value
+        await self.form_view._maybe_reply(interaction)
+
+
+class FormView(discord.ui.View):
+    """Answer choices, booleans, text and numbers, paging through large forms."""
 
     def __init__(self, service: "Service", session_id: str, form: dict, timeout: float = 1800.0) -> None:
         super().__init__(timeout=timeout)
@@ -330,30 +360,52 @@ class FormView(discord.ui.View):
         self.fields = form.get("fields") or []
         self._done = False
         self._answers: dict[str, Any] = {}
+        self._page = 0
         self._render()
 
     @property
     def answerable(self) -> list[dict]:
-        # Booleans are always answerable (Yes/No); other fields need an options
-        # list to be rendered as a control.
-        return [f for f in self.fields if f.get("options") or f.get("type") == "boolean"]
+        return [f for f in self.fields if f.get("options") or
+                f.get("type", "string") in {"boolean", "string", "text", "number", "integer"}]
 
     def _render(self) -> None:
         self.clear_items()
-        # Discord rules: a select must sit alone in its row, buttons may share.
-        # Select fields therefore get one row each, then the boolean fields share
-        # a single button row (capped at five Yes/No pairs worth of buttons).
-        row = 0
-        boolean_fields = [f for f in self.answerable if f.get("type") == "boolean"]
-        for field in self.answerable:
-            if field.get("type") == "boolean":
-                continue
-            if row > 4:
-                break
-            self._add_select(field, row)
-            row += 1
-        if boolean_fields and row <= 4:
-            self._add_boolean_buttons(boolean_fields, row)
+        fields = self.answerable
+        for row, field in enumerate(fields[self._page * 4:self._page * 4 + 4]):
+            if field.get("options"):
+                self._add_select(field, row)
+            elif field.get("type") == "boolean":
+                self._add_boolean_buttons([field], row)
+            else:
+                self._add_input_button(field, row)
+        if len(fields) > 4:
+            self._add_page_button("Previous", -1, self._page == 0)
+            self._add_page_button("Next", 1, (self._page + 1) * 4 >= len(fields))
+
+    def _add_page_button(self, label: str, delta: int, disabled: bool) -> None:
+        button = discord.ui.Button(label=label, row=4, disabled=disabled)
+
+        async def callback(interaction: discord.Interaction) -> None:
+            self._page = max(0, min((len(self.answerable) - 1) // 4, self._page + delta))
+            self._render()
+            await interaction.response.edit_message(view=self)
+
+        button.callback = callback
+        self.add_item(button)
+
+    def _add_input_button(self, field: dict, row: int) -> None:
+        answered = field["key"] in self._answers
+        button = discord.ui.Button(
+            label=_clip_option(f"{'Edit' if answered else 'Enter'}: {field.get('title') or field['key']}", 80),
+            style=discord.ButtonStyle.secondary if answered else discord.ButtonStyle.primary,
+            row=row,
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(FormInputModal(self, field))
+
+        button.callback = callback
+        self.add_item(button)
 
     def _add_boolean_buttons(self, fields: list[dict], row: int) -> None:
         def make_callback(field: dict, value: str):
@@ -366,7 +418,7 @@ class FormView(discord.ui.View):
         # Discord caps a row at five buttons; a boolean form rarely exceeds that.
         for field in fields[:2]:
             yes = discord.ui.Button(
-                label=f"{field.get('title') or field.get('key') or 'Yes'} · Yes",
+                label=_clip_option(f"{field.get('title') or field.get('key') or 'Yes'} · Yes", 80),
                 style=discord.ButtonStyle.primary,
                 row=row,
             )
@@ -403,11 +455,16 @@ class FormView(discord.ui.View):
         self.add_item(select)
 
     async def _maybe_reply(self, interaction: discord.Interaction) -> None:
+        if self._done:
+            await interaction.response.defer()
+            return
         # A single-choice form replies immediately; a multi-field form only
         # submits once every answerable field has been picked.
-        missing = [f["key"] for f in self.answerable if f["key"] not in self._answers]
-        if len(self.answerable) > 1 and missing:
-            await interaction.response.defer()
+        missing = [f["key"] for f in self.fields if f["key"] not in self._answers]
+        if missing:
+            self._render()
+            await interaction.response.edit_message(
+                content=f"Answered {len(self._answers)}/{len(self.fields)} fields.", view=self)
             return
         await self._submit(interaction)
 
@@ -418,13 +475,15 @@ class FormView(discord.ui.View):
         self._done = True
         from .oc import OpenCodeError
 
+        await interaction.response.defer()
         try:
-            await self.svc.client.reply_form(self.session_id, self.form_id, self._answers)
-        except OpenCodeError as exc:
+            await self.svc.client.reply_form(self.session_id, self.form_id, dict(self._answers))
+        except (OpenCodeError, RuntimeError) as exc:
             self._done = False
-            await interaction.response.send_message(f"❌ `{exc.message}`", ephemeral=True)
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
-        await interaction.response.edit_message(content=f"✅ Answered **{self.title}**.", view=None)
+        await interaction.edit_original_response(content=f"✅ Answered **{self.title}**.", view=None)
+        self.stop()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return self.svc.cfg.allowed(interaction.user.id)
@@ -433,11 +492,11 @@ class FormView(discord.ui.View):
 def form_embed(form: dict) -> discord.Embed:
     title = form.get("title") or "Answer needed"
     embed = discord.Embed(
-        title=f"🔎 {title}",
-        description="Pick an option below to answer.",
+        title=_clip_option(f"🔎 {title}", 256),
+        description="Choose an option or use Enter to type an answer. Complete every field to submit.",
         color=discord.Colour.blurple(),
     )
-    for field in form.get("fields") or []:
+    for field in (form.get("fields") or [])[:25]:
         name = field.get("title") or field.get("key") or "field"
         if field.get("description"):
             name += f" — {field.get('description')}"
@@ -445,8 +504,12 @@ def form_embed(form: dict) -> discord.Embed:
             value = "\n".join(
                 f"• `{(o.get('value') or o.get('label') or '')[:60]}`" for o in field.get("options")[:8]
             )
+        elif field.get("type") == "boolean":
+            value = "_Choose Yes or No below._"
+        elif field.get("type", "string") in {"string", "text", "number", "integer"}:
+            value = "_Use Enter below to type your answer._"
         else:
-            value = "_free-text field — not answerable from Discord_"
+            value = "_This field type must be answered in OpenCode._"
         embed.add_field(name=name[:256], value=value or "_no options_", inline=False)
     return embed
 

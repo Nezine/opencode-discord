@@ -12,6 +12,7 @@
 
 #include "client.hpp"
 #include "config.hpp"
+#include "forms.hpp"
 #include "json.hpp"
 
 #include "sse.hpp"
@@ -169,6 +170,10 @@ PYBIND11_MODULE(_engine, m) {
     // ------------------------------------------------------------------ text
 
     m.attr("LIMIT") = text::LIMIT;
+
+    m.def("parse_form_input", [](const py::object& field, const std::string& input) {
+        return json_to_py(engine::parse_form_input(py_to_json(field), input));
+    }, py::arg("field"), py::arg("input"));
 
     m.def(
         "clip",
