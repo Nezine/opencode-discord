@@ -13,6 +13,7 @@
 #include "client.hpp"
 #include "config.hpp"
 #include "forms.hpp"
+#include "workflow.hpp"
 #include "json.hpp"
 
 #include "sse.hpp"
@@ -170,6 +171,22 @@ PYBIND11_MODULE(_engine, m) {
     // ------------------------------------------------------------------ text
 
     m.attr("LIMIT") = text::LIMIT;
+
+    py::class_<engine::PromptQueue>(m, "PromptQueue")
+        .def(py::init<>())
+        .def("push", [](engine::PromptQueue& q, const py::object& v) { return q.push(py_to_json(v)); })
+        .def("pop", [](engine::PromptQueue& q) { return json_to_py(q.pop()); })
+        .def("remove", &engine::PromptQueue::remove)
+        .def("clear", &engine::PromptQueue::clear)
+        .def_property_readonly("size", &engine::PromptQueue::size)
+        .def("entries", [](const engine::PromptQueue& q) { return json_to_py(q.entries()); })
+        .def("snapshot", [](const engine::PromptQueue& q) { return json_to_py(q.snapshot()); })
+        .def("restore", [](engine::PromptQueue& q, const py::object& v) { q.restore(py_to_json(v)); });
+    m.def("project_name", &engine::project_name);
+    m.def("transcript_entries", [](const py::object& messages) { return json_to_py(engine::transcript_entries(py_to_json(messages))); });
+    m.def("export_transcript", [](const py::object& session, const py::object& messages, const std::string& format) {
+        return engine::export_transcript(py_to_json(session), py_to_json(messages), format);
+    });
 
     m.def("parse_form_input", [](const py::object& field, const std::string& input) {
         return json_to_py(engine::parse_form_input(py_to_json(field), input));
@@ -343,6 +360,11 @@ PYBIND11_MODULE(_engine, m) {
         .def("conversation_ids", &engine::Store::conversation_ids, py::arg("user_id"),
              py::arg("limit") = 200)
         .def("forget", &engine::Store::forget, py::arg("user_id"), py::arg("session_id"))
+        .def("save_project", [](engine::Store& s, long long user, const std::string& name, const py::object& data) { s.save_project(user, name, py_to_json(data)); })
+        .def("projects", [](engine::Store& s, long long user) { return json_to_py(s.projects(user)); })
+        .def("delete_project", &engine::Store::delete_project)
+        .def("save_queue", [](engine::Store& s, long long user, const py::object& data) { s.save_queue(user, py_to_json(data)); })
+        .def("load_queue", [](engine::Store& s, long long user) { return json_to_py(s.load_queue(user)); })
         .def("close", &engine::Store::close);
 
     // ------------------------------------------------------------------ turn
@@ -532,7 +554,10 @@ PYBIND11_MODULE(_engine, m) {
     m.def("cache_dir", &cache_dir);
 
     m.def("discover_service", []() {
-        const engine::ServiceEndpoint endpoint = engine::discover_service();
+        const engine::ServiceEndpoint endpoint = [] {
+            py::gil_scoped_release release;
+            return engine::discover_service();
+        }();
         return py::make_tuple(endpoint.url, endpoint.username, endpoint.password);
     });
 
@@ -593,6 +618,7 @@ class OpenCodeError(RuntimeError):
         .def_property_readonly("reconnects", &engine::OpenCodeClient::reconnects)
         .def_property_readonly("parser_largest", &engine::OpenCodeClient::parser_largest)
         .def_property_readonly("parser_dropped", &engine::OpenCodeClient::parser_dropped)
+        .def_property_readonly("queue_dropped", &engine::OpenCodeClient::queue_dropped)
         .def(
             "start",
             [](engine::OpenCodeClient& self) {

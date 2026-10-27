@@ -33,11 +33,15 @@ run "$PY" -m tests.ensure_script
 run "$PY" -m tests.messenger
 run "$PY" -m tests.runner_output
 run "$PY" -m tests.commands_flow
+run "$PY" -m tests.workflows
+run "$PY" -m tests.reliability
+run "$PY" -m tests.doctor
 
 if [[ "${1:-}" == "--live" ]]; then
   run "$PY" -m tests.e2e
   run "$PY" -m tests.permissions
   run "$PY" -m tests.big_event
+  run "$PY" -m tests.workflow_live
 fi
 
 echo

@@ -28,7 +28,7 @@
 
 namespace engine {
 
-// An HTTP response with status >= 400. The binding turns this into the Python
+// An HTTP failure (status >= 400), or a transport failure (status 0). The binding turns this into the Python
 // OpenCodeError, carrying status/message/payload.
 class HttpError : public std::runtime_error {
 public:
@@ -65,6 +65,7 @@ public:
 
     std::size_t parser_largest() const { return parser_largest_.load(); }
     std::size_t parser_dropped() const { return parser_dropped_.load(); }
+    std::size_t queue_dropped() const { return queue_dropped_.load(); }
     long long reconnects() const { return reconnects_.load(); }
 
     // ------------------------------------------------------------- endpoints
@@ -135,6 +136,7 @@ private:
     std::atomic<long long> reconnects_{0};
     std::atomic<std::size_t> parser_largest_{0};
     std::atomic<std::size_t> parser_dropped_{0};
+    std::atomic<std::size_t> queue_dropped_{0};
 
     std::mutex mutex_;
     std::condition_variable cv_;

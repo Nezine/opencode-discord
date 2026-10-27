@@ -95,6 +95,12 @@ class StubClient:
     async def permissions(self, session_id: str) -> list[dict]:
         return []
 
+    async def forms(self, session_id: str) -> list[dict]:
+        return []
+
+    async def messages(self, session_id: str) -> list[dict]:
+        return []
+
     async def prompt(self, session_id, text, *, files=None, delivery=None) -> dict:
         self.prompts.append((text, delivery))
         return {"id": "msg_x"}

@@ -1,4 +1,5 @@
 #include "store.hpp"
+#include "workflow.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -122,6 +123,24 @@ Store::Store(std::string path) : path_(std::move(path)) {
         fail(db_, "open");
     }
 
+    // Queues contain prompt text, not just session IDs. Keep the database and
+    // existing WAL sidecars readable only by the account running the bot.
+    if (path_ != ":memory:") {
+        for (const auto& suffix : {"", "-wal", "-shm"}) {
+            const auto target = std::filesystem::path(path_ + suffix);
+            std::error_code error;
+            if (!std::filesystem::exists(target, error) && !error) continue;
+            std::filesystem::permissions(target,
+                std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                std::filesystem::perm_options::replace, error);
+            if (error) {
+                sqlite3_close(db_);
+                db_ = nullptr;
+                throw std::runtime_error("Cannot restrict SQLite state permissions: " + error.message());
+            }
+        }
+    }
+
     // Match the original's pragmas. In-memory databases ignore WAL.
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr);
@@ -155,6 +174,14 @@ void Store::init_schema() {
 
         CREATE INDEX IF NOT EXISTS conversations_user
             ON conversations (user_id, last_seen DESC);
+
+        CREATE TABLE IF NOT EXISTS projects (
+            user_id INTEGER NOT NULL, name TEXT NOT NULL, payload TEXT NOT NULL,
+            PRIMARY KEY (user_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS queues (
+            user_id INTEGER PRIMARY KEY, payload TEXT NOT NULL
+        );
     )sql";
 
     char* error = nullptr;
@@ -313,6 +340,56 @@ void Store::forget(long long user_id, const std::string& session_id) {
     stmt.step_done();
 }
 
+void Store::save_project(long long user_id, const std::string& name, const Json& payload) {
+    const auto key = project_name(name);
+    if (!payload.is_object()) throw std::invalid_argument("Project settings must be an object.");
+    const std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO projects(user_id,name,payload) VALUES(?,?,?) "
+                       "ON CONFLICT(user_id,name) DO UPDATE SET payload=excluded.payload");
+    stmt.bind_int64(1, user_id);
+    stmt.bind_text(2, key);
+    stmt.bind_text(3, payload.dump());
+    stmt.step_done();
+}
+Json Store::projects(long long user_id) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT name,payload FROM projects WHERE user_id=? ORDER BY name");
+    stmt.bind_int64(1, user_id);
+    Json result = Json::object();
+    int rc;
+    while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW)
+        result[*column_optional_text(stmt.get(), 0)] = Json::parse(*column_optional_text(stmt.get(), 1));
+    if (rc != SQLITE_DONE) fail(db_, "projects");
+    return result;
+}
+bool Store::delete_project(long long user_id, const std::string& name) {
+    const auto key = project_name(name);
+    const std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "DELETE FROM projects WHERE user_id=? AND name=?");
+    stmt.bind_int64(1, user_id);
+    stmt.bind_text(2, key);
+    stmt.step_done();
+    return sqlite3_changes(db_) != 0;
+}
+void Store::save_queue(long long user_id, const Json& payload) {
+    PromptQueue validated;
+    validated.restore(payload);
+    const std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "INSERT INTO queues(user_id,payload) VALUES(?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload");
+    stmt.bind_int64(1, user_id);
+    stmt.bind_text(2, payload.dump());
+    stmt.step_done();
+}
+Json Store::load_queue(long long user_id) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    Statement stmt(db_, "SELECT payload FROM queues WHERE user_id=?");
+    stmt.bind_int64(1, user_id);
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_DONE) return nullptr;
+    if (rc != SQLITE_ROW) fail(db_, "load queue");
+    return Json::parse(*column_optional_text(stmt.get(), 0));
+}
 void Store::close() {
     const std::lock_guard<std::mutex> lock(mutex_);
     if (db_ != nullptr) {

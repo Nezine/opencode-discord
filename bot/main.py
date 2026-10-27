@@ -55,9 +55,24 @@ class GatedTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not isinstance(interaction.channel, discord.DMChannel):
             return False
-        if self.allow_any_user:
-            return True
-        return interaction.user.id in self.allowed_user_ids
+        if not self.allow_any_user and interaction.user.id not in self.allowed_user_ids:
+            return False
+        command = getattr(interaction, "command", None)
+        if command and command.name in {"new", "use", "model", "effort", "agent", "dir", "undo", "redo", "compact", "fork", "delete"}:
+            conversation = self.client.svc.conversation(interaction.user.id)
+            try:
+                conversation.require_idle()
+            except BusyError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return False
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        cause = getattr(error, "original", error)
+        log.error("slash command failed", exc_info=(type(cause), cause, cause.__traceback__))
+        text = str(cause) if isinstance(cause, (BusyError, ValueError, OpenCodeError)) else "Command failed. Please try again."
+        m = Messenger.after_defer(interaction) if interaction.response.is_done() else Messenger(interaction=interaction, ephemeral=True)
+        await m.send(f"⚠️ {clip(text, 400)}")
 
 
 class DMBot(commands.Bot):
@@ -146,11 +161,13 @@ class DMBot(commands.Bot):
                     f"⚠️ `{attachment.filename}` is too large (max 25 MB).",
                     allowed_mentions=NO_MENTIONS,
                 )
-                continue
+                return
             try:
                 files.append(await self.svc.save_attachment(attachment))
-            except OSError as exc:
+            except (OSError, discord.HTTPException) as exc:
                 log.warning("could not save attachment: %s", exc)
+                await message.reply(f"⚠️ Could not download `{attachment.filename}`. Please attach it again.", allowed_mentions=NO_MENTIONS)
+                return
 
         if not text and not files:
             return
@@ -165,6 +182,8 @@ class DMBot(commands.Bot):
                     await conversation.send_text(text, messenger, files=files)
                 except BusyError as exc:
                     await messenger.send(f"⏳ {exc}")
+                except ValueError as exc:
+                    await messenger.send(f"⚠️ {clip(str(exc), 400)}")
                 except OpenCodeError as exc:
                     await messenger.send(
                         f"❌ **OpenCode error**\n`{clip(exc.message, 400)}`\n"
@@ -333,6 +352,7 @@ async def main() -> int:
         await service.start()
     except OpenCodeError as exc:
         log.error("cannot reach the OpenCode service at %s: %s", cfg.opencode_url, exc.message)
+        await service.close()
         return 1
 
     bot = DMBot(cfg, service)
@@ -350,5 +370,10 @@ async def main() -> int:
     return 0
 
 
+def cli() -> int:
+    """Synchronous console-script entry point (setuptools cannot await main)."""
+    return asyncio.run(main())
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(cli())

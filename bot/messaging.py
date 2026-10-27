@@ -15,8 +15,6 @@ from .textutil import sanitize_mentions
 log = logging.getLogger("messaging")
 
 NO_MENTIONS = discord.AllowedMentions.none()
-# A slash-command interaction token dies ~15 minutes after the initial response.
-TOKEN_TTL = 13 * 60
 
 
 class Messenger:
@@ -38,7 +36,7 @@ class Messenger:
         self.mention_author = mention_author and reference is not None
         self.ephemeral = ephemeral
         self._done = _deferred
-        self._reply: discord.Message | None = reference
+        self._reply: discord.Message | None = None
 
     @property
     def target(self) -> discord.abc.Messageable | None:
@@ -110,20 +108,20 @@ class Messenger:
             kwargs.pop("reference", None)
             kwargs.pop("mention_author", None)
             kwargs.pop("silent", None)
-            if ephemeral is not None and ephemeral != self.ephemeral:
-                return await self.interaction.followup.send(content, ephemeral=ephemeral, **kwargs)
-            return await self.interaction.followup.send(content, **kwargs)
+            flag = self.ephemeral if ephemeral is None else ephemeral
+            return await self.interaction.followup.send(content, ephemeral=flag, **kwargs)
         target = self.target
         if target is None:
             return None
-        return await target.send(content, **kwargs)
+        self._reply = await target.send(content, **kwargs)
+        return self._reply
 
 
 class LiveMessage:
     """A message that is edited in place while a turn streams.
 
-    Edits are throttled to stay under Discord's rate limit, and the live message
-    transparently re-posts itself if the interaction token is about to expire.
+    Edits are throttled; deleted messages and failed final edits are re-posted.
+    Long-running turns use a channel Messenger, not an expiring interaction.
     """
 
     def __init__(self, messenger: Messenger, interval: float = 1.5) -> None:
@@ -163,23 +161,36 @@ class LiveMessage:
         async with self._lock:
             if self._closed or content == self._content:
                 return
-            self._content = content
-            self._last_edit = now
-            if self._repost_needed or self._expired():
-                self.message = await self.messenger.send(content)
-                self._created = now
-                self._repost_needed = False
+            now = time.monotonic()
+            if not force and now - self._last_edit < self.interval:
                 return
+            self._last_edit = now
             try:
-                await self.message.edit(content=content, allowed_mentions=NO_MENTIONS)
+                if self._repost_needed or self.message is None:
+                    self.message = await self.messenger.send(content)
+                    self._created = now
+                    self._repost_needed = self.message is None
+                else:
+                    await self.message.edit(content=sanitize_mentions(content), allowed_mentions=NO_MENTIONS)
             except discord.NotFound:
                 self.message = await self.messenger.send(content)
                 self._created = now
             except discord.HTTPException as exc:
                 log.debug("live edit failed: %s", exc)
+                if force:
+                    # Do not silently lose a final answer after a failed edit.
+                    self.message = await self.messenger.send(content)
+                else:
+                    return
+            self._content = content
 
     async def finish(self, content: str | None = None) -> None:
         if self._closed:
+            if content is not None and content != self._content:
+                # A tool step can be flushed before the turn itself fails or
+                # times out. Preserve its answer, but still show the new status.
+                await self.messenger.send(content)
+                self._content = content
             return
         if content is not None:
             await self.update(content, force=True)
@@ -199,8 +210,3 @@ class LiveMessage:
             pass
         except discord.HTTPException as exc:
             log.debug("could not delete placeholder: %s", exc)
-
-    def _expired(self) -> bool:
-        if self.messenger.interaction is None:
-            return False
-        return (time.monotonic() - self._created) > TOKEN_TTL

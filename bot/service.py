@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import time
+import uuid
 from pathlib import Path
 import discord
 
@@ -228,8 +229,8 @@ class Service:
             return
         try:
             session = await conversation.use_session(session_id)
-        except OpenCodeError as exc:
-            await interaction.response.send_message(f"❌ `{clip(exc.message, 200)}`", ephemeral=True)
+        except (OpenCodeError, BusyError) as exc:
+            await interaction.response.send_message(f"❌ `{clip(str(exc), 200)}`", ephemeral=True)
             return
         await interaction.response.edit_message(
             content=(
@@ -261,7 +262,7 @@ class Service:
         directory = Path(self.cfg.attachment_dir)
         directory.mkdir(parents=True, exist_ok=True)
         safe = "".join(c for c in attachment.filename if c.isalnum() or c in "._-")[:80] or "file"
-        target = directory / f"{int(time.time())}-{safe}"
+        target = directory / f"{uuid.uuid4().hex}-{safe}"
         await attachment.save(target)
         return {
             "uri": target.resolve().as_uri(),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING
 from .messaging import LiveMessage, Messenger
 from .oc import OpenCodeClient, OpenCodeError
 from .store import UserState
+from ._engine import PromptQueue, transcript_entries
 from .textutil import clip, duration, human_cost, human_tokens, split_text
 from .turn import (
     TurnState,
@@ -37,6 +39,7 @@ TERMINAL = {
     "session.execution.failed",
     "session.execution.aborted",
     "session.execution.interrupted",
+    "session.interrupted",
     "session.error",
 }
 
@@ -45,6 +48,16 @@ STOP_EMOJI = "🛑"
 
 class BusyError(RuntimeError):
     pass
+
+
+def idle_action(method):
+    """Serialize session/settings changes against prompt admission."""
+    @functools.wraps(method)
+    async def invoke(self, *args, **kwargs):
+        self.require_idle()
+        async with self._lock:
+            return await method(self, *args, **kwargs)
+    return invoke
 
 
 class Conversation:
@@ -57,6 +70,42 @@ class Conversation:
         self._lock = asyncio.Lock()
         self._sub = None
         self._stop_requested = False
+        self._stopping = False
+        self.queue = PromptQueue()
+        self.queue.restore(service.store.load_queue(user_id))
+        self._queue_messengers: dict[int, Messenger] = {}
+
+    def require_idle(self) -> None:
+        if self.busy or self._stopping or self._lock.locked() or self.queue.size:
+            raise BusyError("Finish or stop the current turn and clear the queue before changing conversations/settings.")
+
+    def _save_queue(self) -> None:
+        self.svc.store.save_queue(self.user_id, self.queue.snapshot())
+
+    def _mutate_queue(self, operation, *args):
+        """Keep memory and SQLite consistent if a write fails (e.g. full disk)."""
+        before = self.queue.snapshot()
+        try:
+            result = operation(*args)
+            self._save_queue()
+            return result
+        except Exception:
+            self.queue.restore(before)
+            raise
+
+    async def remove_queued(self, item_id: int | None = None) -> int:
+        async with self._lock:
+            return self._remove_queued(item_id)
+
+    def _remove_queued(self, item_id: int | None) -> int:
+        if item_id is None:
+            count = self.queue.size
+            self._mutate_queue(self.queue.clear)
+            self._queue_messengers.clear()
+        else:
+            count = int(self._mutate_queue(self.queue.remove, item_id))
+            self._queue_messengers.pop(item_id, None)
+        return count
 
     # ------------------------------------------------------------- properties
 
@@ -114,9 +163,15 @@ class Conversation:
                 if not exc.not_found:
                     raise
                 log.info("session %s vanished, creating a new one", self.state.session_id)
-        return await self.create_session()
+        return await self._create_session()
 
+    @idle_action
     async def create_session(
+        self, title: str | None = None, directory: str | None = None
+    ) -> str:
+        return await self._create_session(title, directory)
+
+    async def _create_session(
         self, title: str | None = None, directory: str | None = None
     ) -> str:
         if self.busy:
@@ -140,7 +195,11 @@ class Conversation:
         self._remember(session)
         return session["id"]
 
+    @idle_action
     async def use_session(self, session_id: str) -> dict:
+        return await self._use_session(session_id)
+
+    async def _use_session(self, session_id: str) -> dict:
         session = await self.client.get_session(session_id)
         model = session.get("model") or {}
         if model.get("providerID"):
@@ -150,19 +209,17 @@ class Conversation:
         location = (session.get("location") or {}).get("directory")
         if location:
             self.state.directory = location
+        self.state.agent = session.get("agent") or self.state.agent
         self.state.session_id = session_id
         self.state.title = session.get("title")
         self._save()
         self._remember(session)
         return session
 
+    @idle_action
     async def set_model(self, provider_id: str, model_id: str, variant: str | None) -> None:
         if self.busy:
             raise BusyError("stop the running turn before switching models")
-        self.state.provider_id = provider_id
-        self.state.model_id = model_id
-        self.state.variant = variant or None
-        self._save()
         if self.state.session_id:
             try:
                 await self.client.set_model(
@@ -171,27 +228,36 @@ class Conversation:
             except OpenCodeError as exc:
                 if not exc.not_found:
                     raise
+        self.state.provider_id = provider_id
+        self.state.model_id = model_id
+        self.state.variant = variant or None
+        self._save()
 
+    @idle_action
     async def set_effort(self, variant: str | None) -> None:
         if not self.state.has_model:
             await self.svc.apply_default_model(self)
-        self.state.variant = variant or None
-        self._save()
+        if not self.state.has_model:
+            raise ValueError("No model is available. Configure a provider in OpenCode first.")
         if self.state.session_id:
             await self.client.set_model(
                 self.state.session_id, self.state.provider_id, self.state.model_id, variant
             )
-
-    async def set_agent(self, agent: str) -> None:
-        self.state.agent = agent
+        self.state.variant = variant or None
         self._save()
+
+    @idle_action
+    async def set_agent(self, agent: str) -> None:
         if self.state.session_id:
             try:
                 await self.client.set_agent(self.state.session_id, agent)
             except OpenCodeError as exc:
                 if not exc.not_found:
                     raise
+        self.state.agent = agent
+        self._save()
 
+    @idle_action
     async def set_directory(self, directory: str) -> None:
         self.state.directory = directory
         self._save()
@@ -199,42 +265,89 @@ class Conversation:
     # ------------------------------------------------------------- public turn
 
     async def send_text(
-        self, text: str, messenger: Messenger, files: list[dict] | None = None
+        self, text: str, messenger: Messenger, files: list[dict] | None = None,
+        *, delivery: str | None = None,
     ) -> None:
         """Send a user message to the model and stream the answer back."""
         text = text.strip()
         if not text and not files:
             return
 
-        if self.busy:
-            if self.svc.cfg.steer_when_busy and self.state.session_id:
-                await self.client.prompt(
-                    self.state.session_id, text or "(see attachment)", files=files, delivery="steer"
-                )
-                await messenger.send(
-                    "↪️ _Added to the running turn_ — `/stop` cancels it."
-                )
-            else:
-                await messenger.send("⏳ Still working on the previous message. `/stop` cancels it.")
-            return
+        if delivery not in (None, "queue", "steer"):
+            raise ValueError("Choose queue or steer.")
+        async with self._lock:
+            if self._stopping:
+                raise BusyError("The current turn is stopping. Please try again in a moment.")
+            if self.busy or self.queue.size:
+                steer = delivery == "steer" or (delivery is None and self.svc.cfg.steer_when_busy)
+                if self.busy and steer and not self._stop_requested:
+                    await self.client.prompt(self.session_id, text or "(see attachment)", files=files, delivery="steer")
+                    await messenger.send("↪️ Added to the running turn. `/stop` cancels it.")
+                else:
+                    item_id = self._mutate_queue(self.queue.push, {"text": text, "files": files or [], "session_id": self.session_id})
+                    self._queue_messengers[item_id] = messenger
+                    hint = "Runs after the current turn." if self.busy else "Use `/queue resume` to continue."
+                    await messenger.send(f"📥 Queued #{item_id} ({self.queue.size} waiting). {hint}")
+                return
+            session_id = await self.ensure_session()
+            self._start_worker(session_id, text, messenger, files)
+            task = self.turn_task
+        await task
 
-        session_id = await self.ensure_session()
+    def _start_worker(self, session_id: str, text: str, messenger: Messenger, files) -> None:
         self.busy = True
         self._stop_requested = False
-        self.turn_task = asyncio.create_task(
-            self._run_turn(session_id, text, messenger, files), name=f"turn-{self.user_id}"
-        )
+        self.turn_task = asyncio.create_task(self._drain(session_id, text, messenger, files), name=f"turn-{self.user_id}")
+
+    async def resume_queue(self, messenger: Messenger) -> None:
+        async with self._lock:
+            if self.busy or self._stopping:
+                raise BusyError("A turn is still running.")
+            items = self.queue.entries()
+            if not items:
+                await messenger.send("The queue is empty.")
+                return
+            if items[0]["session_id"] != self.session_id:
+                raise BusyError("Queued messages belong to a different conversation. Clear the queue before continuing.")
+            await self.client.get_session(self.session_id)
+            if self.session_id in await self.client.active_sessions():
+                raise BusyError("OpenCode is still working on this conversation. Use /pending or /stop before resuming.")
+            item = self._mutate_queue(self.queue.pop)
+            self._queue_messengers.pop(item["id"], None)
+            self._start_worker(self.session_id, item["text"], messenger, item["files"])
+            task = self.turn_task
+        await task
+
+    async def _drain(self, session_id: str, text: str, messenger: Messenger, files) -> None:
         try:
-            await self.turn_task
+            while True:
+                success = await self._run_turn(session_id, text, messenger, files)
+                with contextlib.suppress(Exception):
+                    await self._maybe_title(session_id)
+                async with self._lock:
+                    if not success or self._stop_requested or not self.queue.size:
+                        break
+                    item = self.queue.entries()[0]
+                    if item["session_id"] != session_id:
+                        break
+                    next_messenger = self._queue_messengers.get(item["id"], messenger)
+                    # Keep the item queued if Discord cannot announce it.
+                    await next_messenger.send(f"▶️ Starting queued message #{item['id']}.")
+                    self._mutate_queue(self.queue.pop)
+                    messenger = self._queue_messengers.pop(item["id"], messenger)
+                    text, files = item["text"], item["files"]
         except asyncio.CancelledError:
             log.info("turn cancelled for user %s", self.user_id)
         except Exception:  # noqa: BLE001
             log.exception("turn failed for user %s", self.user_id)
+            with contextlib.suppress(Exception):
+                await messenger.send("❌ The turn could not finish. Use `/history` to check the result and `/pending` for unanswered questions.")
         finally:
             self.busy = False
             self.turn_task = None
-            with contextlib.suppress(Exception):
-                await self._maybe_title(session_id)
+            if self.queue.size and not getattr(self.svc, "_closed", False):
+                with contextlib.suppress(Exception):
+                    await messenger.send(f"⏸️ {self.queue.size} queued messages paused. `/queue resume` continues; `/queue clear` removes them.")
 
     async def _run_turn(
         self,
@@ -242,7 +355,7 @@ class Conversation:
         text: str,
         messenger: Messenger,
         files: list[dict] | None,
-    ) -> None:
+    ) -> bool:
         sub = self.client.subscribe(session_id)
         self._sub = sub
         state = TurnState(session_id=session_id)
@@ -260,7 +373,7 @@ class Conversation:
                 )
             except OpenCodeError as exc:
                 await live.finish(f"❌ **Could not send the message**\n`{clip(exc.message, 300)}`")
-                return
+                return False
 
             deadline = time.monotonic() + self.svc.cfg.turn_timeout
             started = False
@@ -279,17 +392,21 @@ class Conversation:
                         "🔌 Lost the connection to OpenCode before the turn finished. "
                         "The answer may still be in the conversation — `/history` will show it."
                     )
-                    break
+                    return False
                 except asyncio.TimeoutError:
                     now = time.monotonic()
+                    if getattr(sub, "dropped", 0) or getattr(sub, "disconnected", False):
+                        await live.finish("🔌 The event stream reconnected or lost data. Use `/history`, `/export` and `/pending` to recover; queued messages are paused.")
+                        return False
                     if now > deadline:
                         await live.finish(
                             "⏱️ **Timed out** waiting for the model. `/stop` clears the turn."
                         )
                         with contextlib.suppress(Exception):
                             await self.client.interrupt(session_id)
-                        break
-                    if now - last_event > self.svc.cfg.stall_timeout:
+                        return False
+                    if (not state.pending_permissions and not state.pending_forms
+                            and now - last_event > self.svc.cfg.stall_timeout):
                         await live.finish(
                             f"⏱️ No activity for {int(self.svc.cfg.stall_timeout)}s — the "
                             "connection to OpenCode looks stuck. `/stop` to give up, "
@@ -297,16 +414,25 @@ class Conversation:
                         )
                         with contextlib.suppress(Exception):
                             await self.client.interrupt(session_id)
-                        break
+                        return False
                     continue
                 except Exception as exc:  # noqa: BLE001
                     log.warning("event read failed: %s", exc)
-                    break
+                    await live.finish("🔌 Connection interrupted. Use `/history` and `/pending` to recover results and questions.")
+                    return False
                 last_event = time.monotonic()
+                if getattr(sub, "dropped", 0) or getattr(sub, "disconnected", False):
+                    await live.finish("⚠️ Some progress events were lost. Use `/history` or `/export` for the complete result; queued messages are paused.")
+                    return False
 
                 kind = event.get("type", "")
                 log.debug("event %s", kind)
                 apply_event(state, event)
+                if time.monotonic() > deadline:
+                    await live.finish("⏱️ Turn time limit reached. Use `/history` for the partial result.")
+                    with contextlib.suppress(Exception):
+                        await self.client.interrupt(session_id)
+                    return False
                 if kind in TERMINAL:
                     break
                 if kind == "session.execution.started":
@@ -354,14 +480,15 @@ class Conversation:
                     flushed.add(step.message_id)
                     await self._flush_step(state, step, messenger, live, model_label)
 
-            if not started and not state.steps:
+            if not started and not state.steps and state.outcome not in {"failed", "interrupted", "aborted"}:
                 await live.finish(
                     "⚠️ The session did not start a reply. "
                     "Check `/status`, or try `/new` to start a clean conversation."
                 )
-                return
+                return False
 
             await self._finish_turn(state, messenger, live, model_label)
+            return state.outcome == "succeeded"
         finally:
             self._sub = None
             sub.close()
@@ -420,11 +547,11 @@ class Conversation:
         if state.outcome == "interrupted" or (self._stop_requested and state.outcome != "succeeded"):
             await live.finish(f"{STOP_EMOJI} {clip(state.error or 'Stopped.', 300)}")
             return
-        if state.outcome in {"failed", "aborted"} and state.error:
-            detail = state.error
+        if state.outcome in {"failed", "aborted"}:
+            detail = state.error or "The turn failed. Use /history to inspect the partial result."
             if "interrupt" in detail.lower() or self._stop_requested:
                 detail = "Stopped by `/stop`."
-            await live.finish(f"{STOP_EMOJI} {clip(detail, 400)}")
+            await live.finish(f"❌ {clip(detail, 400)}")
             return
 
         last = state.steps[-1] if state.steps else None
@@ -478,39 +605,40 @@ class Conversation:
             self._remember(session)
 
     async def stop(self, messenger: Messenger) -> bool:
-        self._stop_requested = True
-        if not self.state.session_id:
-            await messenger.send("There is no active conversation.")
-            return False
+        async with self._lock:
+            if self._stopping:
+                raise BusyError("The current turn is already stopping.")
+            session_id, task = self.session_id, self.turn_task
+            self._stopping = True
+            self._stop_requested = True
         try:
-            await self.client.interrupt(self.state.session_id)
-        except OpenCodeError as exc:
-            await messenger.send(f"❌ `{clip(exc.message, 200)}`")
-            return False
-        await messenger.send(f"{STOP_EMOJI} Interrupting the current turn…")
-        return True
+            if not session_id:
+                await messenger.send("There is no active conversation.")
+                return False
+            try:
+                await self.client.interrupt(session_id)
+            except OpenCodeError as exc:
+                await messenger.send(f"❌ `{clip(exc.message, 200)}`")
+                return False
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await messenger.send(f"{STOP_EMOJI} Stopped. Queued messages stay paused; `/queue resume` continues them.")
+            return True
+        finally:
+            self._stopping = False
 
     # ------------------------------------------------------------- transcripts
 
     async def transcript(self, limit: int = 12) -> list[dict]:
-        session_id = await self.ensure_session()
+        session_id = self.session_id
+        if not session_id:
+            return []
         messages = await self.client.messages(session_id)
-        useful: list[dict] = []
-        for message in messages:
-            kind = message.get("type")
-            if kind == "user":
-                useful.append({"role": "user", "text": message.get("text") or ""})
-            elif kind == "assistant":
-                text = "".join(
-                    part.get("text") or ""
-                    for part in message.get("content") or []
-                    if part.get("type") == "text"
-                ).strip()
-                if text:
-                    useful.append({"role": "assistant", "text": text})
-        return useful[-limit:]
+        return transcript_entries(messages)[-limit:]
 
     async def status(self) -> dict:
         if not self.state.session_id:
-            await self.ensure_session()
+            return {}
         return await self.client.get_session(self.state.session_id)

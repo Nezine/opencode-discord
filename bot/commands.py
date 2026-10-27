@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import functools
 
 import discord
 from discord import app_commands
@@ -13,6 +14,7 @@ from .runner import BusyError, Conversation
 from .service import Service
 from .textutil import clip, rel_time, split_text
 from .ui import EM_DASH, SelectOnlyView, status_embed
+from .workflows import setup_workflows
 
 log = logging.getLogger("commands")
 
@@ -24,6 +26,9 @@ HELP = """**OpenCode over Discord** — chat in this DM, control it with slash c
 • `/sessions [query]` — browse past conversations
 • `/use <conversation>` — jump to one by id or title
 • `/history [n]` — replay recent messages
+• `/ask <text> [delivery]` — queue a message or steer the running turn
+• `/queue` — list, remove, clear or resume waiting messages
+• `/pending` — restore unanswered questions and permission buttons
 • `/stop` — interrupt the running turn
 
 **Controls**
@@ -32,6 +37,7 @@ HELP = """**OpenCode over Discord** — chat in this DM, control it with slash c
 • `/agent [name]` — switch agent (build / plan)
 • `/dir [path]` — working directory for new conversations
 • `/status` — current session, model, cost
+• `/project` — save, restore or remove project presets
 
 **Session tools**
 • `/undo` — roll back the last exchange
@@ -39,6 +45,8 @@ HELP = """**OpenCode over Discord** — chat in this DM, control it with slash c
 • `/compact` — summarise the context
 • `/rename <title>` — set the conversation title
 • `/fork` — branch the conversation
+• `/export` — download full text as Markdown or JSON
+• `/search <query>` — find text in the current conversation
 • `/forget` — drop it from the list
 • `/delete` — delete it on the server
 
@@ -52,6 +60,7 @@ Type `/` in the DM to see everything. Uploads (images, files) are forwarded to t
 
 
 def setup(tree: app_commands.CommandTree, svc: Service) -> None:
+    setup_workflows(tree, svc)
     def messenger(interaction: discord.Interaction) -> Messenger:
         return Messenger(interaction=interaction, ephemeral=True)
 
@@ -61,6 +70,20 @@ def setup(tree: app_commands.CommandTree, svc: Service) -> None:
 
     def conv(interaction: discord.Interaction) -> Conversation:
         return svc.conversation(interaction.user.id)
+
+    def serialized(fn):
+        """Hold prompt admission while a command changes the remote session."""
+        @functools.wraps(fn)
+        async def invoke(interaction, *args, **kwargs):
+            conversation = conv(interaction)
+            try:
+                conversation.require_idle()
+            except BusyError as exc:
+                await messenger(interaction).send(str(exc))
+                return
+            async with conversation._lock:
+                return await fn(interaction, *args, **kwargs)
+        return invoke
 
     def failure(exc: OpenCodeError) -> str:
         """Render an API error, adding a hint for the common 409 case."""
@@ -152,7 +175,9 @@ def setup(tree: app_commands.CommandTree, svc: Service) -> None:
 
     @tree.command(name="help", description="Show the command list and how to use the bot")
     async def cmd_help(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(HELP, ephemeral=True)
+        m = messenger(interaction)
+        for chunk in split_text(HELP, 1900):
+            await m.send(chunk)
 
     # ---------------------------------------------------------- conversations
 
@@ -432,7 +457,7 @@ def setup(tree: app_commands.CommandTree, svc: Service) -> None:
         m = deferred(interaction)
         try:
             session = await conv_obj.status()
-            pending = len(await svc.client.permissions(session["id"]))
+            pending = len(await svc.client.permissions(session["id"])) if session.get("id") else 0
         except OpenCodeError as exc:
             await m.send(failure(exc))
             return
@@ -443,10 +468,12 @@ def setup(tree: app_commands.CommandTree, svc: Service) -> None:
     @tree.command(name="stop", description="Interrupt the running turn")
     async def cmd_stop(interaction: discord.Interaction) -> None:
         conv_obj = conv(interaction)
-        m = messenger(interaction)
+        await interaction.response.defer(ephemeral=True)
+        m = deferred(interaction)
         await conv_obj.stop(m)
 
     @tree.command(name="undo", description="Roll back the last exchange")
+    @serialized
     async def cmd_undo(interaction: discord.Interaction) -> None:
         conv_obj = conv(interaction)
         await interaction.response.defer(ephemeral=True)
@@ -472,17 +499,21 @@ def setup(tree: app_commands.CommandTree, svc: Service) -> None:
         )
 
     @tree.command(name="redo", description="Cancel a pending rollback")
+    @serialized
     async def cmd_redo(interaction: discord.Interaction) -> None:
         conv_obj = conv(interaction)
+        await interaction.response.defer(ephemeral=True)
+        m = deferred(interaction)
         try:
             session_id = await conv_obj.ensure_session()
             await svc.client.clear_revert(session_id)
         except OpenCodeError as exc:
-            await interaction.response.send_message(failure(exc), ephemeral=True)
+            await m.send(failure(exc))
             return
-        await interaction.response.send_message("↪️ Rollback cancelled.", ephemeral=True)
+        await m.send("↪️ Rollback cancelled.")
 
     @tree.command(name="compact", description="Summarise the context to save tokens")
+    @serialized
     async def cmd_compact(interaction: discord.Interaction) -> None:
         conv_obj = conv(interaction)
         await interaction.response.defer(ephemeral=True)
@@ -499,32 +530,36 @@ def setup(tree: app_commands.CommandTree, svc: Service) -> None:
 
     @tree.command(name="rename", description="Rename the conversation")
     @app_commands.describe(title="New title")
+    @serialized
     async def cmd_rename(interaction: discord.Interaction, title: str) -> None:
         conv_obj = conv(interaction)
+        await interaction.response.defer(ephemeral=True)
+        m = deferred(interaction)
         try:
             session_id = await conv_obj.ensure_session()
             await svc.client.update_session(session_id, title=title[:120])
         except OpenCodeError as exc:
-            await interaction.response.send_message(failure(exc), ephemeral=True)
+            await m.send(failure(exc))
             return
         conv_obj.state.title = title[:120]
         svc.store.save_user(conv_obj.state)
         svc.store.remember(conv_obj.user_id, session_id, title[:120])
-        await interaction.response.send_message(f"✏️ Renamed to **{title[:120]}**", ephemeral=True)
+        await m.send(f"✏️ Renamed to **{title[:120]}**")
 
     @tree.command(name="fork", description="Branch this conversation into a new one")
+    @serialized
     async def cmd_fork(interaction: discord.Interaction) -> None:
         conv_obj = conv(interaction)
+        await interaction.response.defer(ephemeral=True)
+        m = deferred(interaction)
         try:
             session_id = await conv_obj.ensure_session()
             forked = await svc.client.fork_session(session_id)
         except OpenCodeError as exc:
-            await interaction.response.send_message(failure(exc), ephemeral=True)
+            await m.send(failure(exc))
             return
-        await conv_obj.use_session(forked["id"])
-        await interaction.response.send_message(
-            f"🍴 Forked into a new conversation\n-#`{forked['id']}`", ephemeral=True
-        )
+        await conv_obj._use_session(forked["id"])
+        await m.send(f"🍴 Forked into a new conversation\n-#`{forked['id']}`")
 
     @tree.command(name="forget", description="Remove the conversation from the list (keeps the data)")
     async def cmd_forget(interaction: discord.Interaction) -> None:
@@ -536,22 +571,25 @@ def setup(tree: app_commands.CommandTree, svc: Service) -> None:
         await interaction.response.send_message("🗑️ Removed from your list.", ephemeral=True)
 
     @tree.command(name="delete", description="Delete the conversation on the server")
+    @serialized
     async def cmd_delete(interaction: discord.Interaction) -> None:
         conv_obj = conv(interaction)
         if not conv_obj.session_id:
             await interaction.response.send_message("No conversation to delete.", ephemeral=True)
             return
         session_id = conv_obj.session_id
+        await interaction.response.defer(ephemeral=True)
+        m = deferred(interaction)
         try:
             await svc.client.delete_session(session_id)
         except OpenCodeError as exc:
-            await interaction.response.send_message(failure(exc), ephemeral=True)
+            await m.send(failure(exc))
             return
         svc.store.forget(conv_obj.user_id, session_id)
         conv_obj.state.session_id = None
         conv_obj.state.title = None
         svc.store.save_user(conv_obj.state)
-        await interaction.response.send_message("🗑️ Deleted. `/new` starts a fresh one.", ephemeral=True)
+        await m.send("🗑️ Deleted. `/new` starts a fresh one.")
 
     @tree.command(name="refresh", description="Reload models and agents from the server")
     async def cmd_refresh(interaction: discord.Interaction) -> None:

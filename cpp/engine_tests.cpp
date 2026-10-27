@@ -22,6 +22,7 @@
 #include "text.hpp"
 #include "turn.hpp"
 #include "utf8.hpp"
+#include "workflow.hpp"
 
 namespace {
 
@@ -545,6 +546,52 @@ void test_client() {
 
 }  // namespace
 
+void test_workflows() {
+    engine::PromptQueue queue;
+    const Json payload{{"session_id", "session"}, {"text", "tiếng Việt 🦀"}};
+    eq("queue first ID", queue.push(payload), 1LL);
+    eq("queue second ID", queue.push(payload), 2LL);
+    check("queue removes by ID", queue.remove(1));
+    const Json saved = queue.snapshot();
+    engine::PromptQueue restored;
+    restored.restore(saved);
+    check("queue restore roundtrip", restored.snapshot() == saved);
+    check("queue FIFO", restored.pop()["id"] == 2);
+    eq("queue ID survives restore", restored.push(payload), 3LL);
+    const Json before = restored.snapshot();
+    bool rejected = false;
+    try {
+        restored.restore(Json{{"next_id", 0}, {"items", Json::array()}});
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    check("invalid restore rejected atomically", rejected && restored.snapshot() == before);
+    restored.clear();
+    check("queue empty pop", restored.pop().is_null());
+    for (int i = 0; i < 20; ++i) restored.push(payload);
+    rejected = false;
+    try { restored.push(payload); } catch (const std::invalid_argument&) { rejected = true; }
+    check("queue bounded", rejected && restored.size() == 20);
+    eq("project normalized", engine::project_name("My-Project_1"), std::string("my-project_1"));
+    const Json messages = Json::array({
+        Json{{"type", "user"}, {"id", "u"}, {"text", "hello"}},
+        Json{{"type", "assistant"}, {"id", "a"}, {"content", Json::array({
+            Json{{"type", "text"}, {"text", "answer"}},
+            Json{{"type", "reasoning"}, {"text", "private"}}
+        })}}
+    });
+    const Json session{{"id", "s"}, {"title", "Title"}};
+    const Json exported = Json::parse(engine::export_transcript(session, messages, "json"));
+    check("export contains complete text", exported["messages"][1]["text"] == "answer");
+    check("export excludes private parts", engine::export_transcript(session, messages, "markdown").find("private") == std::string::npos);
+    engine::Store store(":memory:");
+    store.save_project(1, "Work", session);
+    check("project scoped to user", store.projects(1)["work"] == session && store.projects(2).empty());
+    store.save_queue(1, saved);
+    check("queue persisted", store.load_queue(1) == saved && store.load_queue(2).is_null());
+    check("project delete", store.delete_project(1, "WORK") && !store.delete_project(1, "work"));
+}
+
 int main() {
     check("form preserves text", engine::parse_form_input(Json{{"type", "string"}}, "  hello\n") == Json("  hello\n"));
     check("form parses integer", engine::parse_form_input(Json{{"type", "integer"}}, "42") == Json(42));
@@ -564,6 +611,7 @@ int main() {
     test_turn();
     test_config();
     test_client();
+    test_workflows();
 
     std::printf("\n%s\n", std::string(40, '=').c_str());
     if (failures != 0) {

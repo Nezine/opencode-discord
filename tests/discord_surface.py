@@ -100,6 +100,7 @@ def test_tree() -> None:
         "help", "new", "sessions", "use", "history", "model", "effort", "agent",
         "dir", "status", "stop", "undo", "redo", "compact", "rename", "fork",
         "forget", "delete", "refresh", "sync",
+        "ask", "queue", "project", "export", "search", "pending",
     }
     check("all commands registered", expected <= set(commands), f"missing {expected - set(commands)}")
     check("no unexpected commands", set(commands) <= expected, f"extra {set(commands) - expected}")

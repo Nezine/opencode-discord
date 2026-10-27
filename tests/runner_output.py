@@ -14,7 +14,7 @@ class RunnerOutputTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         service = SimpleNamespace(
             cfg=SimpleNamespace(show_reasoning=True, show_tools=True),
-            store=SimpleNamespace(get_user=lambda _: SimpleNamespace()),
+            store=SimpleNamespace(get_user=lambda _: SimpleNamespace(), load_queue=lambda _: None),
         )
         self.conversation = Conversation(service, 1)
         self.conversation._hydrate = AsyncMock()

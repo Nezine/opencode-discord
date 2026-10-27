@@ -642,7 +642,7 @@ void apply_event(TurnState& state, const Json& event) {
                 break;
             }
         }
-    } else if (kind == "session.execution.succeeded") {
+    } else if (kind == "session.execution.succeeded" || kind == "session.execution.completed") {
         state.outcome = "succeeded";
         state.retrying = false;
     } else if (kind == "session.execution.failed" || kind == "session.execution.aborted" ||

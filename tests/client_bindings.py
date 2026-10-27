@@ -12,7 +12,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from bot.oc import OpenCodeClient
+from bot.oc import OpenCodeClient, OpenCodeError
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -21,6 +21,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         query = parse_qs(urlsplit(self.path).query)
+        if urlsplit(self.path).path == "/api/session/test/message":
+            self.server.message_queries.append(query)
+            if "cursor" not in query:
+                self.respond({"data": [{"id": "old", "type": "user"}], "cursor": {"next": "next-page"}})
+            else:
+                self.respond({"data": [{"id": "new", "type": "user"}], "cursor": {"next": None}})
+            return
+        if urlsplit(self.path).path == "/api/session/loop/message":
+            self.respond({"data": [], "cursor": {"next": "repeated"}})
+            return
         self.respond({"data": [], "cursor": query})
 
     def do_POST(self):
@@ -39,13 +49,32 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class ClientBindingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transport_failure_has_catchable_status_zero(self):
+        # Reserve then close an OS-selected port; there is no HTTP server here.
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_port
+        server.server_close()
+        client = OpenCodeClient(f"http://127.0.0.1:{port}", timeout=0.5)
+        try:
+            with self.assertRaises(OpenCodeError) as caught:
+                await client.get_session("missing")
+            self.assertEqual(caught.exception.status, 0)
+            self.assertFalse(caught.exception.not_found)
+        finally:
+            await client.close()
+
     async def test_optional_arguments_from_worker_thread(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.requests = []
+        server.message_queries = []
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         client = OpenCodeClient(f"http://127.0.0.1:{server.server_port}", timeout=3)
         try:
+            self.assertEqual([message["id"] for message in await client.messages("test")], ["old", "new"])
+            self.assertEqual(server.message_queries, [{"order": ["asc"], "limit": ["100"]}, {"cursor": ["next-page"], "limit": ["100"]}])
+            with self.assertRaisesRegex(RuntimeError, "pagination did not advance"):
+                await client.messages("loop")
             # An empty attachment list is what plain DMs pass to prompt().
             for files in (None, [], [{"url": "file:///tmp/image.png", "mime": "image/png"}]):
                 result = await client.prompt("test", "hello", files=files, delivery="steer")

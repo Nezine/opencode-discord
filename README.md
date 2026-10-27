@@ -159,6 +159,12 @@ idle period so that only one process owns the background service.
 | `/sessions [query] [scope]` | Browse past conversations in a paged menu |
 | `/use <conversation>` | Jump to one by id or title (autocomplete) |
 | `/history [n]` | Replay recent messages |
+| `/ask <text> [delivery]` | Send now; while busy, queue (default) or steer |
+| `/queue [action] [item_id]` | List, remove, clear or resume waiting messages |
+| `/export [format]` | Download the full text transcript as Markdown or JSON |
+| `/search <query>` | Case-insensitive search through the current conversation |
+| `/project [action] [name] [overwrite]` | Save, list, use or remove named project presets |
+| `/pending` | Re-display unanswered permissions and questions |
 | `/model [provider/model]` | Switch model (autocomplete across every enabled model) |
 | `/effort [level]` | Reasoning effort for the current model (`low`…`max`) |
 | `/agent [name]` | Switch agent (`build`, `plan`, …) |
@@ -189,8 +195,52 @@ Tool summaries appear once after each step's answer.
 `xhigh`, `max` depending on the model. `/effort` maps onto those, and switching
 model keeps your effort if the new model supports it.
 
-**Steering.** Message the bot while a turn is running and the text is injected
-into the live turn (`delivery: "steer"`) instead of queueing. `/stop` cancels.
+**Steering and queueing.** Plain DMs follow `STEER_WHEN_BUSY` (default `true`):
+while busy they either steer the current turn or join the queue. `/ask` gives
+you an explicit choice, independent of that default:
+
+```text
+/ask text:Review the tests delivery:queue
+/ask text:Focus on the database first delivery:steer
+/queue action:list
+/queue action:remove item_id:2
+/queue action:resume
+```
+
+The queue holds up to 20 waiting messages per user, runs them in order, and
+stores them in SQLite across bot restarts. `/queue clear` removes waiting items
+without stopping the current turn. `/stop`, a failed turn, a lost event stream,
+or a restart leaves waiting items paused until `/queue resume`. Resume checks
+that OpenCode is no longer running the previous turn. Queued messages are pinned
+to their original conversation; clear the queue before changing session,
+model, effort, agent or directory.
+The state database and SQLite sidecar files are restricted to the Linux user
+running the bot (`0600`), because queued prompts can contain private text.
+
+Only **waiting** messages are recovered. Once a prompt starts, the bot does not
+automatically resend it: the model may already have edited files or run a tool.
+After an interruption, inspect `/history`, `/export` and `/pending` before
+deciding whether to retry. Resuming the queue does not recover live streaming
+for an already-running OpenCode turn.
+
+**Project presets.** Set `/dir`, create `/new`, choose the model/agent, then
+`/project action:save name:firmware`. Later, `/project action:use name:firmware`
+restores that conversation and its settings. Up to 25 presets are kept per
+Discord user. Names use 1–40 letters, digits, `_` or `-`, case-insensitively.
+Saving an existing name requires `overwrite:true`. A preset is a snapshot;
+save it again after choosing a different conversation. If its conversation
+was deleted, the saved preferences create a fresh one on your next message.
+Removing a preset never deletes the conversation or project files.
+
+**Export and search.** `/export format:markdown` or `format:json` downloads
+user/assistant text without the preview or history length limits (maximum
+8 MiB per export). It excludes tool output, reasoning and attachment contents.
+`/search query:…` searches that same full text, handles Unicode case folding,
+and shows the last 10 matching messages with excerpts near the match.
+History, search and export follow API pagination in chronological order. To
+bound memory use, reading stops with an explicit error above 10,000 messages
+or 64 MiB of API data (including tool records); it never silently exports only
+the first page. Very large conversations should be opened in OpenCode directly.
 
 **Permissions.** When the agent asks to do something (read a `.env`, touch a
 path outside the project), the bot posts the request with *Allow once* /
@@ -204,9 +254,16 @@ submission. Forms with more than four fields have Previous/Next buttons.
 Multi-field forms submit once every field is answered, and keep your answers
 if the server request fails so you can retry. Input windows accept up to 4,000
 characters per answer. Unsupported field types must be answered in OpenCode.
+If buttons expire or the bot restarts, `/pending` fetches unanswered requests
+and renders fresh controls. Waiting for an answer does not trigger the
+inactivity timer; the overall `TURN_TIMEOUT` still applies.
 
 **Files.** Attachments are written to `ATTACHMENT_DIR` and passed to the model as
-file URIs, so images work with multimodal models.
+file URIs, so images work with multimodal models. Unique filenames prevent
+simultaneous uploads with the same name from overwriting each other. A failed
+download or oversized file stops that message, so the model is not silently
+asked to work without a required attachment. Uploaded files are retained in
+the cache; do not remove files referenced by a waiting queue or active session.
 
 **Attachments to Discord output.** Answers longer than 1900 characters are split
 on paragraph boundaries with code fences kept balanced; each turn ends with a dim
@@ -299,10 +356,36 @@ sanitizers without instrumenting the extension the bot loads:
 - `tests/messenger.py` — message kwargs run through discord.py's own validation
 - `tests/commands_flow.py` — every slash command's callback executed against a
   fake interaction, asserting each one actually replies
+- `tests/workflows.py` — native queue validation, randomized FIFO checks,
+  database migration/reopen, concurrent messages, stop/resume, project presets,
+  full transcript export, Unicode search and pending-request recovery
+- `tests/reliability.py` — stream loss/overflow, hard timeouts, waiting for user
+  input, subscription cleanup, failed live edits and final-answer delivery
+- `tests/doctor.py` — read-only diagnostics and credential-safe error reports
+- `tests/workflow_live.py` — opt-in saved-queue recovery, two real model turns
+  in order and transcript export; isolated session/database, no Discord login
 
 The live suites create sessions in a temp directory and delete them afterwards.
 
 ## Troubleshooting
+
+Start with the local doctor, which works even when the Discord bot is offline:
+
+```sh
+./doctor.sh                 # loads .env; checks local state and OpenCode API
+./doctor.sh --offline       # no network probe
+./doctor.sh --json          # machine-readable report
+```
+
+It checks the C++ extension, required configuration, working directory, SQLite
+integrity, both systemd services and a read-only API endpoint. It does not
+start/stop services, change saved state, send prompts, log in to Discord or
+print tokens/passwords. `WARN` can be normal for manual installations; `FAIL`
+sets exit status 1. Run as the same Linux user as the bot. A healthy local
+report does **not** prove Discord gateway login or successful DM delivery;
+inspect `journalctl --user -u opencode-discord -n 40` and send a DM to test those.
+If you installed the package rather than using the checkout, run
+`opencode-discord-doctor` with the environment variables already exported.
 
 **Slash commands don't appear.** The bot registers them *globally* on start-up,
 because a global registration is the only one that reaches DM channels —

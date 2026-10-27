@@ -1,6 +1,7 @@
 #include "client.hpp"
 
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cstddef>
 #include <mutex>
@@ -156,8 +157,8 @@ Json OpenCodeClient::request(const std::string& method, const std::string& path,
     curl_easy_cleanup(curl);
 
     if (code != CURLE_OK) {
-        throw std::runtime_error(std::string("opencode request failed: ") +
-                                 curl_easy_strerror(code));
+        throw HttpError(0, std::string("opencode request failed: ") +
+                                 curl_easy_strerror(code), std::nullopt);
     }
 
     if (status >= 400) {
@@ -308,8 +309,31 @@ Json OpenCodeClient::prompt(const std::string& session_id, const std::string& te
 }
 
 std::vector<Json> OpenCodeClient::messages(const std::string& session_id) {
-    return list_from_data(
-        request("GET", "/api/session/" + session_id + "/message", {}, std::nullopt));
+    // The API defaults to one newest-first page. Request a chronological
+    // timeline and follow every cursor so history/export/undo see the same data.
+    // Cursors retain order; the API forbids combining cursor with order.
+    std::vector<Json> messages;
+    std::vector<std::pair<std::string, std::string>> query{{"order", "asc"}, {"limit", "100"}};
+    std::set<std::string> seen;
+    std::size_t bytes = 0;
+    while (true) {
+        const Json response = request("GET", "/api/session/" + session_id + "/message", query, std::nullopt);
+        bytes += response.dump().size();
+        auto page = list_from_data(response);
+        if (messages.size() + page.size() > 10000 || bytes > 64u * 1024u * 1024u)
+            throw std::invalid_argument("Conversation exceeds the bridge's safety limit (10,000 messages / 64 MiB). Open it in OpenCode directly.");
+        for (auto& message : page) messages.push_back(std::move(message));
+        const auto cursor = response.is_object() ? response.find("cursor") : response.end();
+        if (cursor == response.end() || !cursor->is_object()) break;
+        const auto next = cursor->find("next");
+        if (next == cursor->end() || next->is_null() || *next == "") break;
+        if (!next->is_string()) throw std::runtime_error("Invalid OpenCode message cursor.");
+        const auto token = next->get<std::string>();
+        if (!seen.insert(token).second || seen.size() > 1000)
+            throw std::runtime_error("OpenCode message pagination did not advance.");
+        query = {{"cursor", token}, {"limit", "100"}};
+    }
+    return messages;
 }
 
 Json OpenCodeClient::message(const std::string& session_id, const std::string& message_id) {
@@ -454,6 +478,7 @@ void OpenCodeClient::push_event(Json event) {
         if (queue_.size() >= capacity_) {
             // Drop the oldest so a slow consumer cannot stall the stream.
             queue_.pop_front();
+            queue_dropped_.fetch_add(1);
         }
         queue_.push_back(std::move(event));
     }

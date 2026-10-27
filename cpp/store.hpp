@@ -16,6 +16,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "json.hpp"
 
 struct sqlite3;
 
@@ -67,6 +68,12 @@ public:
     void forget(long long user_id, const std::string& session_id);
 
     void close();
+
+    void save_project(long long user_id, const std::string& name, const Json& payload);
+    Json projects(long long user_id);
+    bool delete_project(long long user_id, const std::string& name);
+    void save_queue(long long user_id, const Json& payload);
+    Json load_queue(long long user_id);
 
 private:
     void init_schema();

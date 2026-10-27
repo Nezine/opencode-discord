@@ -48,6 +48,7 @@ have genuinely different natures, and each language gets the half it is good at:
 | Turn text composition (`render_*`) | C++ | pure string work |
 | OpenCode HTTP transport + reconnect/backoff | C++ | libcurl, own thread |
 | SQLite persistence | C++ | direct SQLite C API |
+| Durable prompt queue, project-name validation, transcript extraction/export | C++ | pure state and validation, shared with standalone tests |
 | Text chunking / fence balancing / formatting | C++ | code-point-aware, replaces a regex |
 | Config parsing + service discovery | C++ | env, PATH lookup, subprocess, JSON |
 | Discord gateway, commands, views, embeds | Python | `discord.py` is the moat |
@@ -73,6 +74,34 @@ Three seams, all narrow:
    the engine (via `py::exec`) so it keeps the original's constructor, attributes
    and `not_found`/`conflict` properties. Existing `except OpenCodeError` sites
    catch it unchanged.
+   Transport failures also use `OpenCodeError`, with status `0` (no HTTP
+   response), so disconnects take the same recovery path as API errors.
+
+## Durable workflows
+
+`cpp/workflow.cpp` owns the bounded FIFO queue, stable item IDs, strict restore
+validation and full-text transcript conversion. `Store` adds `projects` and
+`queues` tables with `CREATE TABLE IF NOT EXISTS`; existing users and history
+are preserved. Queue state is scoped by Discord user ID and each item is pinned
+to an OpenCode session. Python rolls back in-memory mutations if SQLite fails.
+
+`Conversation` serializes prompt admission and session/settings changes with
+an asyncio lock. A worker drains the queue only after a successful turn. Failure,
+stop or restart pauses waiting items; the user explicitly resumes them. In-flight
+prompts are removed before execution and are never automatically replayed because
+their tools may have side effects. This is not an exactly-once execution system.
+
+`bot/workflows.py` registers the queue/project/export/search/recovery commands.
+Long-running commands acknowledge the interaction first, then stream through
+the DM channel instead of an expiring interaction token. Event subscriptions
+unregister when closed, guarantee a shutdown sentinel even when full, and expose
+native queue/parser loss and reconnects to the runner. Incomplete event streams
+pause the queue and point the user to stored history rather than claiming a
+complete answer.
+
+`bot/doctor.py` is a standalone, read-only troubleshooting entry point. It uses
+native config/discovery/client code but never starts the SSE reader, submits a
+model prompt, restarts a service or prints credentials.
 
 ### Threading rules
 

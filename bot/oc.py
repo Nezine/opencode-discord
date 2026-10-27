@@ -62,6 +62,10 @@ class OpenCodeClient:
     def reconnects(self) -> int:
         return self._native.reconnects
 
+    @property
+    def events_lost(self) -> int:
+        return self._native.parser_dropped + self._native.queue_dropped
+
     # ------------------------------------------------------------------ setup
 
     async def start(self) -> None:
@@ -222,11 +226,15 @@ class OpenCodeClient:
 
     async def _pump(self) -> None:
         """Drain the engine's event queue into the per-session subscriptions."""
-        while not self._closing:
-            events = await asyncio.to_thread(self._native.poll, 256, 250)
-            for event in events:
-                for sub in list(self._subscribers):
-                    sub.push(event)
+        try:
+            while not self._closing:
+                events = await asyncio.to_thread(self._native.poll, 256, 250)
+                for event in events:
+                    for sub in list(self._subscribers):
+                        sub.push(event)
+        finally:
+            for sub in list(self._subscribers):
+                sub.close()
 
     def subscribe(self, session_id: str | None = None) -> "_Subscription":
         sub = _Subscription(self, session_id)
@@ -242,6 +250,8 @@ class _Subscription:
         self.session_id = session_id
         self._queue: asyncio.Queue[Event | None] = asyncio.Queue(maxsize=maxsize)
         self._dropped = 0
+        self._initial_lost = getattr(client, "events_lost", 0)
+        self._initial_reconnects = getattr(client, "reconnects", 0)
         self._closed = False
 
     def push(self, event: Event) -> None:
@@ -269,19 +279,28 @@ class _Subscription:
 
     @property
     def dropped(self) -> int:
-        return self._dropped
+        return self._dropped + max(0, getattr(self._client, "events_lost", 0) - self._initial_lost)
+
+    @property
+    def disconnected(self) -> bool:
+        return getattr(self._client, "reconnects", 0) > self._initial_reconnects
 
     def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
-        try:
-            self._queue.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        self._client._subscribers.discard(self)
+        # Always wake a waiting reader, even if the queue was full at shutdown.
+        if self._queue.full():
+            self._queue.get_nowait()
+        self._queue.put_nowait(None)
 
     def __aiter__(self) -> "_Subscription":
         return self
 
     async def __anext__(self) -> Event:
+        if self._closed and self._queue.empty():
+            raise StopAsyncIteration
         event = await self._queue.get()
         if event is None:
             raise StopAsyncIteration
