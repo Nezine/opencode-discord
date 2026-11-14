@@ -7,8 +7,10 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 # --service registers the endpoint for `opencode service status` and the CLI.
+# If the shared service is already running, this command exits successfully;
+# don't restart it in a loop just because it didn't create a second server.
 ExecStart=/usr/bin/env opencode serve --service --hostname 127.0.0.1
-Restart=always
+Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
 # OpenCode executes tools in user projects and must run outside the bridge's
